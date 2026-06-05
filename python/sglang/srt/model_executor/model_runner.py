@@ -481,13 +481,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
                 )
 
-            set_global_expert_distribution_recorder(
-                ExpertDistributionRecorder.init_new(
-                    server_args,
-                    get_global_expert_location_metadata(),
-                    rank=self.tp_rank,
+            if (
+                get_global_expert_distribution_recorder().__class__.__name__
+                == "_ExpertDistributionRecorderNoop"
+            ):
+                set_global_expert_distribution_recorder(
+                    ExpertDistributionRecorder.init_new(
+                        server_args,
+                        get_global_expert_location_metadata(),
+                        rank=self.tp_rank,
+                    )
                 )
-            )
 
         # Expert parallelism
         self.eplb_manager = (

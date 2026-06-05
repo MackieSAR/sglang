@@ -68,12 +68,23 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+_MXFP8_WEIGHT_SCALE_REMAP_ENABLED = False
+
 
 # use system-level temp directory for file locks, so that multiple users
 # can share the same lock without error.
 # lock files in the temp directory will be automatically deleted when the
 # system reboots, so users will not complain about annoying lock files
 temp_dir = tempfile.gettempdir()
+
+
+def set_mxfp8_weight_scale_remap_enabled(enabled: bool) -> None:
+    global _MXFP8_WEIGHT_SCALE_REMAP_ENABLED
+    _MXFP8_WEIGHT_SCALE_REMAP_ENABLED = enabled
+
+
+def is_mxfp8_weight_scale_remap_enabled() -> bool:
+    return _MXFP8_WEIGHT_SCALE_REMAP_ENABLED
 
 
 def get_lock(
@@ -1255,6 +1266,23 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
     for quark_scale_name, sglang_scale_name in quark_scale_names.items():
         if name.endswith(quark_scale_name):
             return name.replace(quark_scale_name, sglang_scale_name)
+
+    compressed_tensors_mxfp8_scale_names = {
+        ".weight_scale": ".weight_scale_inv",
+        ".w13_weight_scale": ".w13_weight_scale_inv",
+        ".w2_weight_scale": ".w2_weight_scale_inv",
+    }
+    for scale_name, sglang_scale_name in compressed_tensors_mxfp8_scale_names.items():
+        if (
+            not is_mxfp8_weight_scale_remap_enabled()
+            or not name.endswith(scale_name)
+            or name in params_dict
+        ):
+            continue
+
+        # Keep the shard name (e.g. gate_proj) so the model loader's stacked
+        # mapping can still choose the shard_id.
+        return name[: -len(scale_name)] + sglang_scale_name
 
     # If there were no matches, return the untouched param name
     return name

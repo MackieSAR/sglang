@@ -4,6 +4,10 @@ from .compressed_tensors_scheme import (
     CompressedTensorsLinearScheme,
     CompressedTensorsMoEScheme,
 )
+from .compressed_tensors_mxfp8 import (
+    CompressedTensorsMxfp8,
+    CompressedTensorsMxfp8MoE,
+)
 from .compressed_tensors_w4a4_mxint4_moe import CompressedTensorsMxInt4MoE
 from .compressed_tensors_w4a4_nvfp4 import CompressedTensorsW4A4Fp4
 from .compressed_tensors_w4a4_nvfp4_moe import CompressedTensorsW4A4Nvfp4MoE
@@ -26,6 +30,8 @@ from .compressed_tensors_wNa16_moe import (
 __all__ = [
     "CompressedTensorsLinearScheme",
     "CompressedTensorsMoEScheme",
+    "CompressedTensorsMxfp8",
+    "CompressedTensorsMxfp8MoE",
     "CompressedTensorsW8A8Fp8",
     "CompressedTensorsW8A8Fp8MoE",
     "CompressedTensorsW8A16Fp8",

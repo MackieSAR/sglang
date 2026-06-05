@@ -56,6 +56,7 @@ import logging
 import multiprocessing
 import os
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
@@ -66,6 +67,10 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+    set_global_expert_distribution_recorder,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -92,11 +97,181 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.tensor_bridge import use_mlx
 
 
-def start_profile(profile_activities, profile_record_shapes=False, rank_print=print):
+class _BenchMoEExpertDistributionRecorder:
+    def __init__(self, device, max_num_experts, max_num_layers, max_profile_steps):
+        self.device = device
+        self.max_num_experts = max_num_experts
+        self.max_num_layers = max_num_layers
+        self.max_profile_steps = max_profile_steps
+        self._recording = False
+        self._enabled = torch.zeros((), dtype=torch.int64, device=device)
+        self._current_layer_idx = None
+        self._expert_seen = torch.zeros(max_num_experts, dtype=torch.int64, device=device)
+        self._active_experts_per_layer = torch.zeros(
+            max_num_layers, dtype=torch.int64, device=device
+        )
+        self._active_experts_records = []
+
+    @contextmanager
+    def with_current_layer(self, layer_idx):
+        old_layer_idx = self._current_layer_idx
+        self._current_layer_idx = layer_idx
+        try:
+            yield
+        finally:
+            self._current_layer_idx = old_layer_idx
+
+    @contextmanager
+    def with_debug_name(self, debug_name):
+        yield
+
+    @contextmanager
+    def disable_this_region(self):
+        yield
+
+    @contextmanager
+    def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        yield {}
+
+    def start_record(self):
+        self._active_experts_per_layer.zero_()
+        self._active_experts_records.clear()
+        self._enabled.fill_(1)
+        self._recording = True
+
+    def stop_record(self):
+        self._recording = False
+        self._enabled.fill_(0)
+
+    def dump_record(self, output_mode="object"):
+        if self._active_experts_records:
+            active_experts = torch.stack(self._active_experts_records)
+        else:
+            active_experts = torch.zeros(
+                (0, self.max_num_layers), dtype=torch.int64, device="cpu"
+            )
+        return {
+            "active_experts_per_step_layer": active_experts,
+        }
+
+    def begin_profile_step(self):
+        self._active_experts_per_layer.zero_()
+
+    def finish_profile_step(self):
+        active_experts = self._active_experts_per_layer.clone()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(active_experts, op=dist.ReduceOp.MAX)
+        self._active_experts_records.append(active_experts.detach().cpu())
+
+    @property
+    def recording(self):
+        return self._recording
+
+    def on_select_experts(self, topk_ids: torch.Tensor):
+        self.on_select_experts_for_layer(topk_ids, self._current_layer_idx)
+
+    def on_select_experts_for_layer(self, topk_ids: torch.Tensor, layer_idx: int):
+        if layer_idx is None or layer_idx >= self.max_num_layers:
+            return
+
+        topk_ids = topk_ids.reshape(-1)
+        topk_ids = topk_ids.to(device=self.device, dtype=torch.int64)
+        valid = (topk_ids >= 0) & (topk_ids < self.max_num_experts)
+        safe_topk_ids = topk_ids.masked_fill(~valid, 0)
+        self._expert_seen.zero_()
+        self._expert_seen.scatter_add_(
+            dim=0,
+            index=safe_topk_ids,
+            src=valid.to(torch.int64),
+        )
+        active_experts = (self._expert_seen > 0).sum() * self._enabled
+        self._active_experts_per_layer[layer_idx].copy_(
+            torch.maximum(
+                self._active_experts_per_layer[layer_idx],
+                active_experts,
+            )
+        )
+
+    def on_bypassed_topk_logits(
+        self, router_logits: torch.Tensor, top_k: int, layer_idx: int
+    ):
+        _, topk_ids = torch.topk(router_logits, k=top_k, dim=-1, sorted=False)
+        self.on_select_experts_for_layer(topk_ids, layer_idx)
+
+
+def _format_moe_expert_distribution(expert_distribution_output, stage):
+    if not expert_distribution_output:
+        return f"MoE expert distribution ({stage}): no data recorded"
+
+    active_experts = expert_distribution_output.get("active_experts_per_step_layer")
+    if active_experts is None:
+        return f"MoE expert distribution ({stage}): no active_experts_per_step_layer recorded"
+
+    active_experts = active_experts.to(torch.int64)
+    active_rows = active_experts.sum(dim=1) > 0
+    if active_rows.any():
+        active_experts = active_experts[
+            : int(active_rows.nonzero()[-1].item()) + 1
+        ]
+    active_cols = active_experts.sum(dim=0) > 0
+    if active_cols.any():
+        active_experts = active_experts[:, active_cols]
+
+    return (
+        f"MoE active experts per {stage} step/layer. "
+        f"shape={list(active_experts.shape)}, "
+        f"per_step_layer={active_experts.tolist()}, "
+        f"per_step_avg={active_experts.float().mean(dim=1).tolist() if active_experts.numel() > 0 else []}"
+    )
+
+
+def _get_max_num_moe_experts_for_bench(model_config: ModelConfig):
+    hf_config = model_config.hf_text_config
+    for attr in (
+        "n_routed_experts",
+        "num_experts",
+        "moe_num_experts",
+        "num_local_experts",
+    ):
+        value = getattr(hf_config, attr, None)
+        if value:
+            return int(value) + 64
+    return 65536
+
+
+def _get_max_num_layers_for_bench(model_config: ModelConfig):
+    return int(model_config.num_hidden_layers) + 8
+
+
+def _begin_moe_profile_step():
+    recorder = get_global_expert_distribution_recorder()
+    if hasattr(recorder, "begin_profile_step"):
+        recorder.begin_profile_step()
+
+
+def _finish_moe_profile_step():
+    recorder = get_global_expert_distribution_recorder()
+    if hasattr(recorder, "finish_profile_step"):
+        recorder.finish_profile_step()
+
+
+def start_profile(
+    profile_activities,
+    profile_record_shapes=False,
+    rank_print=print,
+    enable_torch_profile=True,
+    record_moe_expert_distribution=False,
+):
     """
     Abstracted function to start profiling based on profile_activities.
     Returns profiler object (or None).
     """
+    if record_moe_expert_distribution:
+        get_global_expert_distribution_recorder().start_record()
+
+    if not enable_torch_profile:
+        return None
+
     if "CUDA_PROFILER" in profile_activities:
         try:
             torch.cuda.cudart().cudaProfilerStart()
@@ -130,21 +305,32 @@ def stop_profile(
     save_trace=False,
     trace_filename=None,
     stage=None,
+    enable_torch_profile=True,
+    record_moe_expert_distribution=False,
 ):
     """
     Abstracted function to stop profiling based on profile_activities.
     Optionally saves trace results and prints completion messages.
     """
-    if "CUDA_PROFILER" in profile_activities:
+    if enable_torch_profile and "CUDA_PROFILER" in profile_activities:
         try:
             torch.cuda.cudart().cudaProfilerStop()
             rank_print("CUDA Profiler stopped (nsys should dump traces)")
         except Exception as e:
             rank_print(f"Failed to stop CUDA profiler: {e}")
-    elif profiler is not None:
+    elif enable_torch_profile and profiler is not None:
         profiler.stop()
 
-    if save_trace:
+    expert_distribution_output = None
+    if record_moe_expert_distribution:
+        recorder = get_global_expert_distribution_recorder()
+        recorder.stop_record()
+        expert_distribution_output = recorder.dump_record(output_mode="object")
+        rank_print(
+            _format_moe_expert_distribution(expert_distribution_output, stage)
+        )
+
+    if enable_torch_profile and save_trace:
         if profiler is not None:
             if trace_filename:
                 _save_profile_trace_results(profiler, trace_filename)
@@ -154,6 +340,8 @@ def stop_profile(
                 )
         if "CUDA_PROFILER" in profile_activities:
             rank_print(f"CUDA profiler trace for {stage} completed")
+
+    return expert_distribution_output
 
 
 @dataclasses.dataclass
@@ -175,6 +363,7 @@ class BenchArgs:
     profile_filename_prefix: str = "profile"
     profile_start_step: Optional[int] = None
     profile_steps: Optional[int] = None
+    print_moe_expert_distribution: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -241,6 +430,11 @@ class BenchArgs:
             type=int,
             default=None,
             help="Number of decode steps to profile starting from profile-start-step. If not specified, profiles only one step.",
+        )
+        parser.add_argument(
+            "--print-moe-expert-distribution",
+            action="store_true",
+            help="Print MoE expert selection totals recorded between start_profile and stop_profile.",
         )
 
     @classmethod
@@ -638,6 +832,7 @@ def latency_test_run_once(
     tp_rank,
     profile_start_step=None,
     profile_steps=None,
+    print_moe_expert_distribution=False,
 ):
     max_batch_size = model_runner.max_batch_size(input_len, output_len)
     if batch_size > max_batch_size:
@@ -658,12 +853,19 @@ def latency_test_run_once(
     tot_latency = 0
 
     profiler = None
-    enable_profile_prefill = profile and profile_stage in ["all", "prefill"]
-    if enable_profile_prefill:
+    enable_torch_profile_prefill = profile and profile_stage in ["all", "prefill"]
+    enable_moe_profile_prefill = (
+        print_moe_expert_distribution and profile_stage in ["all", "prefill"]
+    )
+    if enable_torch_profile_prefill or enable_moe_profile_prefill:
+        if enable_moe_profile_prefill:
+            _begin_moe_profile_step()
         profiler = start_profile(
             profile_activities,
             profile_record_shapes=profile_record_shapes,
             rank_print=rank_print,
+            enable_torch_profile=enable_torch_profile_prefill,
+            record_moe_expert_distribution=enable_moe_profile_prefill,
         )
 
     model_runner.synchronize()
@@ -671,8 +873,10 @@ def latency_test_run_once(
     next_token_ids, _, batch = model_runner.extend(reqs)
     model_runner.synchronize()
     prefill_latency = time.perf_counter() - tic
+    if enable_moe_profile_prefill:
+        _finish_moe_profile_step()
 
-    if enable_profile_prefill:
+    if enable_torch_profile_prefill or enable_moe_profile_prefill:
         trace_filename = _create_torch_profiler_filename(
             profile_filename_prefix, batch_size, input_len, output_len, "prefill"
         )
@@ -683,6 +887,8 @@ def latency_test_run_once(
             save_trace=True,
             trace_filename=trace_filename,
             stage="prefill",
+            enable_torch_profile=enable_torch_profile_prefill,
+            record_moe_expert_distribution=enable_moe_profile_prefill,
         )
 
     tot_latency += prefill_latency
@@ -699,25 +905,45 @@ def latency_test_run_once(
         profile_start_step if profile_start_step is not None else (output_len // 2)
     )
     profile_end = profile_start + (profile_steps if profile_steps is not None else 1)
-    enable_profile_decode = profile and profile_stage in ["all", "decode"]
+    enable_torch_profile_decode = profile and profile_stage in ["all", "decode"]
+    enable_moe_profile_decode = (
+        print_moe_expert_distribution and profile_stage in ["all", "decode"]
+    )
     profiler = None
+    decode_profile_started = False
     for i in range(output_len - 1):
         model_runner.synchronize()
         # Start profiler at the specified step
-        if enable_profile_decode and i == profile_start:
+        if (
+            (enable_torch_profile_decode or enable_moe_profile_decode)
+            and i == profile_start
+        ):
+            if enable_moe_profile_decode:
+                _begin_moe_profile_step()
             profiler = start_profile(
                 profile_activities,
                 profile_record_shapes=profile_record_shapes,
                 rank_print=rank_print,
+                enable_torch_profile=enable_torch_profile_decode,
+                record_moe_expert_distribution=enable_moe_profile_decode,
             )
+            decode_profile_started = True
+        elif enable_moe_profile_decode and decode_profile_started:
+            _begin_moe_profile_step()
 
         tic = time.perf_counter()
         next_token_ids, _ = model_runner.decode(next_token_ids, batch)
         model_runner.synchronize()
         latency = time.perf_counter() - tic
+        if enable_moe_profile_decode and decode_profile_started:
+            _finish_moe_profile_step()
 
         # Stop profiler after the specified number of steps
-        if enable_profile_decode and profiler is not None and i >= profile_end - 1:
+        if (
+            (enable_torch_profile_decode or enable_moe_profile_decode)
+            and decode_profile_started
+            and i >= profile_end - 1
+        ):
             trace_filename = _create_torch_profiler_filename(
                 profile_filename_prefix, batch_size, input_len, output_len, "decode"
             )
@@ -728,8 +954,11 @@ def latency_test_run_once(
                 save_trace=True,
                 trace_filename=trace_filename,
                 stage="decode",
+                enable_torch_profile=enable_torch_profile_decode,
+                record_moe_expert_distribution=enable_moe_profile_decode,
             )
             profiler = None
+            decode_profile_started = False
 
         tot_latency += latency
         throughput = batch_size / latency
@@ -738,6 +967,21 @@ def latency_test_run_once(
             rank_print(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
+
+    if decode_profile_started:
+        trace_filename = _create_torch_profiler_filename(
+            profile_filename_prefix, batch_size, input_len, output_len, "decode"
+        )
+        stop_profile(
+            profiler,
+            profile_activities,
+            rank_print=rank_print,
+            save_trace=True,
+            trace_filename=trace_filename,
+            stage="decode",
+            enable_torch_profile=enable_torch_profile_decode,
+            record_moe_expert_distribution=enable_moe_profile_decode,
+        )
 
     # Record decode timing from 2nd output
     if output_len > 1:
@@ -781,6 +1025,22 @@ def latency_test(
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
+    if bench_args.print_moe_expert_distribution:
+        model_config = ModelConfig.from_server_args(server_args)
+        max_profile_steps = max(
+            1,
+            bench_args.profile_steps or 1,
+            max(bench_args.output_len),
+        )
+        set_global_expert_distribution_recorder(
+            _BenchMoEExpertDistributionRecorder(
+                server_args.device,
+                _get_max_num_moe_experts_for_bench(model_config),
+                _get_max_num_layers_for_bench(model_config),
+                max_profile_steps,
+            )
+        )
+
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
@@ -808,6 +1068,7 @@ def latency_test(
         tp_rank=tp_rank,
         profile_start_step=None,
         profile_steps=None,
+        print_moe_expert_distribution=False,
     )
 
     rank_print("Benchmark ...")
@@ -851,14 +1112,15 @@ def latency_test(
             il,
             ol,
             bench_args.log_decode_step,
-            bench_args.profile if tp_rank == 0 else None,
-            bench_args.profile_record_shapes if tp_rank == 0 else None,
+            bench_args.profile if tp_rank == 0 else False,
+            bench_args.profile_record_shapes if tp_rank == 0 else False,
             bench_args.profile_activities,
             bench_args.profile_filename_prefix,
             bench_args.profile_stage,
             tp_rank,
             bench_args.profile_start_step,
             bench_args.profile_steps,
+            bench_args.print_moe_expert_distribution,
         )
         if ret is not None:
             result_list.append(ret)
@@ -875,6 +1137,13 @@ def latency_test(
 
 def main(server_args, bench_args):
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)
+    if bench_args.print_moe_expert_distribution:
+        if server_args.expert_distribution_recorder_mode is not None:
+            logging.warning(
+                "--print-moe-expert-distribution uses a bench-local recorder; ignoring "
+                f"expert_distribution_recorder_mode={server_args.expert_distribution_recorder_mode!r}."
+            )
+        server_args.expert_distribution_recorder_mode = None
 
     _set_envs_and_config(server_args)
 

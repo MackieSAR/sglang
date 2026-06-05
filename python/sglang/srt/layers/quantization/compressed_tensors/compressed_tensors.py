@@ -40,6 +40,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsLinearScheme,
     CompressedTensorsMoEScheme,
+    CompressedTensorsMxfp8,
+    CompressedTensorsMxfp8MoE,
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
@@ -65,7 +67,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_mxfp8_quantization_config, is_npu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -218,6 +220,8 @@ class CompressedTensorsConfig(QuantizationConfig):
     @property
     def weight_block_size(self) -> Optional[List[int]]:
         """Get the weight block size from the quantization config."""
+        if is_mxfp8_quantization_config(self.config):
+            return [1, 32]
         if "Linear" in self.target_scheme_map:
             weights_config = self.target_scheme_map["Linear"].get("weights")
             if weights_config and hasattr(weights_config, "block_structure"):
@@ -250,7 +254,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ignored_layers=fp8_cfg.get("ignored_layers"),
                 weight_block_size=fp8_cfg.get("weight_block_size"),
             )
-
         return cls(
             target_scheme_map=target_scheme_map,
             ignore=ignore,
@@ -315,7 +318,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
                 target_scheme_map[target]["input_activations"] = None
-                if is_activation_quantization_format(quant_format):
+                if is_activation_quantization_format(
+                    quant_format
+                ) or is_mxfp8_quantization_config(config):
                     input_activations = quant_config.get("input_activations")
                     # The only case where we have activation quant supported
                     # but no input_activations provided in the config
@@ -447,6 +452,38 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_per_tensor_activation = input_quant.strategy == QuantizationStrategy.TENSOR
         return is_symmetric_activation and is_per_tensor_activation
 
+    def _is_mxfp8_w8a8(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        if not is_mxfp8_quantization_config(self.config):
+            return False
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_float = (
+            weight_quant.type == QuantizationType.FLOAT
+            and input_quant.type == QuantizationType.FLOAT
+        )
+        is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
+        is_grouped = (
+            weight_quant.strategy == QuantizationStrategy.GROUP
+            and input_quant.strategy == QuantizationStrategy.GROUP
+        )
+        is_group_size_32 = (
+            weight_quant.group_size == 32 and input_quant.group_size == 32
+        )
+        is_dynamic_activation = not weight_quant.dynamic and input_quant.dynamic
+
+        return (
+            is_float
+            and is_8_bits
+            and is_grouped
+            and is_group_size_32
+            and weight_quant.symmetric
+            and input_quant.symmetric
+            and is_dynamic_activation
+        )
+
     def _is_fp8_w8a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         # Confirm weights quantized.
         if weight_quant is None:
@@ -554,6 +591,9 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _get_scheme_from_parts(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> CompressedTensorsLinearScheme:
+
+        if self._is_mxfp8_w8a8(weight_quant, input_quant):
+            return CompressedTensorsMxfp8()
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
@@ -704,6 +744,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ):
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+        elif self._is_mxfp8_w8a8(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsMxfp8MoE")
+            return CompressedTensorsMxfp8MoE()
         elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
             return CompressedTensorsW4A4Nvfp4MoE()

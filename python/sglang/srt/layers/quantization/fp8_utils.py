@@ -1392,6 +1392,25 @@ def _process_scaled_mm_output(output, input_2d_shape, output_shape):
     return torch.narrow(output, 0, 0, input_2d_shape[0]).view(*output_shape)
 
 
+def _normalize_fp8_gemm_weight_scale(
+    weight_scale: torch.Tensor,
+    output_size: int,
+) -> torch.Tensor:
+    if weight_scale.numel() != output_size:
+        return weight_scale
+
+    if weight_scale.numel() == 1 and weight_scale.dim() < 2:
+        return weight_scale.contiguous()
+
+    if weight_scale.dim() == 2:
+        if weight_scale.shape == (output_size, 1):
+            return weight_scale.contiguous()
+        if weight_scale.shape == (1, output_size):
+            return weight_scale.t().contiguous()
+
+    return weight_scale.reshape(output_size, 1).contiguous()
+
+
 def _apply_fallback_scaled_mm(
     qinput,
     weight,
@@ -1417,6 +1436,9 @@ def _apply_fallback_scaled_mm(
     output = _process_scaled_mm_output(output, input_2d_shape, output_shape)
     x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
 
+    weight_scale = _normalize_fp8_gemm_weight_scale(
+        weight_scale, output_shape[-1]
+    )
     output = output * x_scale * weight_scale.t()
     if bias is not None:
         output = output + bias
@@ -1488,6 +1510,9 @@ def apply_fp8_linear(
                         input_2d, group_size=input_2d.shape[1]
                     )
 
+    weight_scale = _normalize_fp8_gemm_weight_scale(
+        weight_scale, weight.shape[1]
+    )
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
         cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
         if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:

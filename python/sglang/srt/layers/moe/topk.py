@@ -330,6 +330,11 @@ class TopK(MultiPlatformOp):
             )
             return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
         elif output_format == TopKOutputFormat.BYPASSED:
+            recorder = get_global_expert_distribution_recorder()
+            if hasattr(recorder, "on_bypassed_topk_logits"):
+                recorder.on_bypassed_topk_logits(
+                    router_logits, self.topk_config.top_k, self.layer_id
+                )
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -1108,7 +1113,11 @@ def select_experts(
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
 
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    recorder = get_global_expert_distribution_recorder()
+    if hasattr(recorder, "on_select_experts_for_layer"):
+        recorder.on_select_experts_for_layer(topk_ids, layer_id)
+    else:
+        recorder.on_select_experts(topk_ids=topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 

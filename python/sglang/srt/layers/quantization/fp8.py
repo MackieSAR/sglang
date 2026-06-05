@@ -1080,8 +1080,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
-        if not (_is_cuda and is_sm100_supported()):
-            raise RuntimeError("MXFP8 MoE quantization requires SM100.")
+        if not (_is_cuda and (is_sm100_supported() or is_sm120_supported())):
+            raise RuntimeError("MXFP8 MoE quantization requires SM100 or SM120.")
 
         def _quantize_and_swizzle_with_cutlass_es_kernel(weight: torch.Tensor):
             from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant

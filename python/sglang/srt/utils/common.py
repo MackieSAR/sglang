@@ -2622,11 +2622,54 @@ def has_hf_quant_config(model_path: str) -> bool:
         return False
 
 
+def _as_quantization_config_dict(quantization_config: Any) -> dict[str, Any] | None:
+    if quantization_config is None:
+        return None
+    if not isinstance(quantization_config, dict):
+        if not hasattr(quantization_config, "to_dict"):
+            return None
+        quantization_config = quantization_config.to_dict()
+    return quantization_config
+
+
+def is_mxfp8_quantization_config(quantization_config: Any) -> bool:
+    """Return whether a HF quantization config describes MXFP8 weights."""
+    quantization_config = _as_quantization_config_dict(quantization_config)
+    if quantization_config is None:
+        return False
+
+    quant_method = str(quantization_config.get("quant_method", "")).lower()
+    if "mxfp8" in quant_method:
+        return True
+
+    def is_mxfp8_format(value: Any) -> bool:
+        normalized = str(value or "").replace("_", "-").lower()
+        return normalized in {"mxfp8", "mxfp8-quantized"}
+
+    if is_mxfp8_format(quantization_config.get("format")):
+        return True
+
+    config_groups = quantization_config.get("config_groups", {})
+    if isinstance(config_groups, dict):
+        for group in config_groups.values():
+            if isinstance(group, dict) and is_mxfp8_format(group.get("format")):
+                return True
+
+    return False
+
+
 def get_quantization_config(hf_config) -> str | None:
     """Extract quantization method from HuggingFace config."""
     quantization_config = getattr(hf_config, "quantization_config", None)
+    if quantization_config is None:
+        quantization_config = getattr(hf_config, "compression_config", None)
+    quantization_config = _as_quantization_config_dict(quantization_config)
     if quantization_config is not None:
-        return quantization_config.get("quant_method")
+        quant_method = quantization_config.get("quant_method")
+        if quant_method is not None:
+            return quant_method
+        if is_mxfp8_quantization_config(quantization_config):
+            return "compressed-tensors"
     return None
 
 
