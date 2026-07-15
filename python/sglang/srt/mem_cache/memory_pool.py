@@ -356,6 +356,9 @@ class MambaPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        if envs.SGLANG_MAMBA_CACHE_COPY_BYPASS.get():
+            return select_index
+
         # clear at alloc time — expand a scalar GPU zero to the right shape, no CPU-GPU sync
         for i in range(len(self.mamba_cache.conv)):
             t = self.mamba_cache.conv[i]
@@ -382,6 +385,9 @@ class MambaPool:
         )
 
     def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
+        if envs.SGLANG_MAMBA_CACHE_COPY_BYPASS.get():
+            return
+
         for i in range(len(self.mamba_cache.conv)):
             self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
                 :, src_index

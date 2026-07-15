@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -162,6 +163,14 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_final_src = None
         track_ssm_final_dst = None
 
+        # Optimization: Pre-compute has_mamba_track_mask once to avoid redundant .any() calls
+        # which trigger GPU->CPU synchronization (50-200μs each).
+        # This single synchronization replaces multiple redundant checks throughout this function.
+        has_mamba_track_mask = bool(
+            forward_batch.mamba_track_mask is not None
+            and forward_batch.mamba_track_mask.any()
+        )
+
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
@@ -200,10 +209,8 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
-                if (
-                    forward_batch.mamba_track_mask is not None
-                    and forward_batch.mamba_track_mask.any()
-                ):
+                # Use pre-computed has_mamba_track_mask (avoids redundant .any() call)
+                if has_mamba_track_mask:
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
                     )
@@ -228,6 +235,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            has_mamba_track_mask=has_mamba_track_mask,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -584,6 +592,12 @@ class MambaAttnBackendBase(AttentionBackend):
             ssm_states[mamba_track_indices[i]] = ssm_states[cache_indices[i]]
         for all requests where mamba_track_mask[i] is True.
         """
+        if envs.SGLANG_MAMBA_CACHE_COPY_BYPASS.get():
+            return
+
+        # Optimization: Use pre-computed has_mamba_track_mask from forward_metadata.
+        # This avoids redundant checks and unnecessary kernel launches when no tracking is needed.
+        # If all requests in the batch have cached prefixes (mask all False), we skip entirely.
         if forward_batch.mamba_track_mask is not None:
             track_mamba_states_if_needed(
                 conv_states,
@@ -613,10 +627,10 @@ class MambaAttnBackendBase(AttentionBackend):
         Note: Conv state tracking for extend is handled separately via gather operations
         using indices computed by `_init_track_conv_indices`.
         """
-        if (
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        ):
+        if envs.SGLANG_MAMBA_CACHE_COPY_BYPASS.get():
+            return
+
+        if forward_metadata.has_mamba_track_mask:
             h = h.squeeze(0)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:

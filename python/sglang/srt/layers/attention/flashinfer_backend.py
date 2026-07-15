@@ -24,10 +24,13 @@ from sglang.srt.compilation.piecewise_context_manager import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+    launch_reshape_and_cache_flat,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
@@ -753,6 +756,80 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def _try_fused_fp8_kv_cache_store(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        cache_loc: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> bool:
+        kv_pool = forward_batch.token_to_kv_pool
+        if (
+            not hasattr(kv_pool, "dtype")
+            or kv_pool.dtype != torch.float8_e4m3fn
+            or not hasattr(kv_pool, "get_kv_buffer")
+            # The fused kernel reproduces the existing BF16 in-place
+            # quantization order. FP16/FP32 inputs must keep using the generic
+            # pool path because their intermediate rounding is different.
+            or k.dtype != torch.bfloat16
+            or v.dtype != torch.bfloat16
+            or k.dim() != 3
+            or v.dim() != 3
+            or k.shape[:2] != v.shape[:2]
+            # SWAKVPool.set_kv_buffer translates full-cache locations to its
+            # separate sliding-window pool. Direct buffer writes would bypass
+            # that translation and can store K/V in the wrong slots.
+            or isinstance(kv_pool, SWAKVPool)
+        ):
+            return False
+
+        # The fused kernel currently supports the scalar KV scales used by
+        # FP8 FlashInfer attention. Keep the generic pool implementation as
+        # the fallback for per-head scales and other scale representations.
+        k_scale = layer.k_scale
+        v_scale = layer.v_scale
+        if k_scale is None or v_scale is None:
+            return False
+        # Preserve bit-for-bit compatibility with the existing BF16 in-place
+        # quantization path. Non-unit scales currently have a different
+        # intermediate rounding order in Triton, so keep them on the generic
+        # implementation until that case has a dedicated kernel test.
+        if (
+            getattr(layer, "k_scale_float", None) != 1.0
+            or getattr(layer, "v_scale_float", None) != 1.0
+        ):
+            return False
+        if (
+            not isinstance(k_scale, torch.Tensor)
+            or not isinstance(v_scale, torch.Tensor)
+            or k_scale.numel() != 1
+            or v_scale.numel() != 1
+        ):
+            return False
+
+        k_cache, v_cache = kv_pool.get_kv_buffer(layer.layer_id)
+        if (
+            k_cache.dim() != 3
+            or v_cache.dim() != 3
+            or k_cache.dtype != kv_pool.dtype
+            or v_cache.dtype != kv_pool.dtype
+            or k_cache.shape[1:] != k.shape[1:]
+            or v_cache.shape[1:] != v.shape[1:]
+        ):
+            return False
+
+        launch_reshape_and_cache_flat(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            cache_loc,
+            k_scale,
+            v_scale,
+        )
+        return True
+
     @debug_kernel_api
     def forward_extend(
         self,
@@ -779,9 +856,12 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                    if not self._try_fused_fp8_kv_cache_store(
+                        layer, forward_batch, cache_loc, k, v
+                    ):
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
 
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -862,9 +942,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
+                if not self._try_fused_fp8_kv_cache_store(
+                    layer, forward_batch, cache_loc, k, v
+                ):
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -890,9 +973,12 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
+                if not self._try_fused_fp8_kv_cache_store(
+                    layer, forward_batch, cache_loc, k, v
+                ):
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
 
         # Call the wrapped function
         o = decode_wrapper.forward(

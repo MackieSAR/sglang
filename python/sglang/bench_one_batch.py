@@ -225,6 +225,351 @@ def _format_moe_expert_distribution(expert_distribution_output, stage):
     )
 
 
+def _get_config_value(config, *names, default=None):
+    for name in names:
+        value = getattr(config, name, None)
+        if value is not None:
+            return value
+    return default
+
+
+def _estimate_weight_bytes_per_value(model_config: ModelConfig):
+    quant_config = getattr(model_config.hf_config, "quantization_config", None)
+    if isinstance(quant_config, dict):
+        quant_method = str(quant_config.get("quant_method", "")).lower()
+        if "fp8" in quant_method:
+            return 1
+    try:
+        return torch.empty((), dtype=model_config.dtype).element_size()
+    except TypeError:
+        return 2
+
+
+def _estimate_moe_expert_weight_bytes(model_config: ModelConfig):
+    hf_config = model_config.hf_text_config
+    hidden_size = _get_config_value(hf_config, "hidden_size")
+    intermediate_size = _get_config_value(
+        hf_config,
+        "moe_intermediate_size",
+        "ffn_dim",
+        "intermediate_size",
+    )
+    if hidden_size is None or intermediate_size is None:
+        return None
+    return int(hidden_size) * int(intermediate_size) * 3 * _estimate_weight_bytes_per_value(
+        model_config
+    )
+
+
+def _format_bytes(num_bytes):
+    if num_bytes is None:
+        return "n/a"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(num_bytes)
+    unit = units[0]
+    for unit in units:
+        if abs(value) < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+    return f"{value:.3f} {unit}"
+
+
+def _summarize_moe_distribution_for_profile(
+    expert_distribution_output, model_config: ModelConfig
+):
+    if not expert_distribution_output:
+        return None
+
+    active_experts = expert_distribution_output.get("active_experts_per_step_layer")
+    if active_experts is None or active_experts.numel() == 0:
+        return None
+
+    active_experts = active_experts.to(torch.float32)
+    active_rows = active_experts.sum(dim=1) > 0
+    if active_rows.any():
+        active_experts = active_experts[
+            : int(active_rows.nonzero()[-1].item()) + 1
+        ]
+    active_cols = active_experts.sum(dim=0) > 0
+    if active_cols.any():
+        active_experts = active_experts[:, active_cols]
+    if active_experts.numel() == 0:
+        return None
+
+    expert_weight_bytes = _estimate_moe_expert_weight_bytes(model_config)
+    active_expert_instances = int(active_experts.sum().item())
+    active_weight_bytes = (
+        active_expert_instances * expert_weight_bytes
+        if expert_weight_bytes is not None
+        else None
+    )
+    return {
+        "shape": list(active_experts.shape),
+        "avg_active_experts_per_step_layer": float(active_experts.mean().item()),
+        "min_active_experts_per_step_layer": int(active_experts.min().item()),
+        "max_active_experts_per_step_layer": int(active_experts.max().item()),
+        "active_expert_instances": active_expert_instances,
+        "expert_weight_bytes": expert_weight_bytes,
+        "active_weight_bytes": active_weight_bytes,
+    }
+
+
+def _categorize_profiler_event(name):
+    key = name.lower()
+    if any(x in key for x in ("fused_moe", "inplace_fused_experts")):
+        return "moe_gemm"
+    if any(
+        x in key
+        for x in (
+            "topkgating",
+            "topk_softmax",
+            "moe_align",
+            "count_and_sort_expert",
+        )
+    ):
+        return "moe_route"
+    if any(
+        x in key
+        for x in (
+            "moe_sum",
+            "silu_and_mul",
+            "act_and_mul",
+            "memcpy32_post",
+            "triton_per_fused_copy__mul_sum",
+        )
+    ):
+        return "moe_postprocess"
+    if any(
+        x in key
+        for x in (
+            "create_flashinfer_kv_indices",
+            "devicescan",
+            "cub::devicescan",
+            "clamp_position",
+        )
+    ):
+        return "graph_metadata"
+    if any(
+        x in key
+        for x in (
+            "gated_delta",
+            "gdn",
+            "causal_conv1d",
+            "qkvzba",
+            "chunkgateddeltarule",
+        )
+    ):
+        return "linear_attn_gdn"
+    if any(
+        x in key
+        for x in (
+            "batchdecodewithpagedkvcache",
+            "batchprefillwithpagedkvcache",
+            "flash_fwd",
+            "paged_attention",
+            "attention",
+        )
+    ):
+        return "attention_kernel"
+    if any(
+        x in key
+        for x in (
+            "fp8_blockwise_scaled_mm",
+            "scaled_mm",
+            "gemm",
+            "cublas",
+            "cutlass::kernel",
+            "aten::mm",
+            "aten::matmul",
+            "aten::linear",
+        )
+    ):
+        return "gemm_other"
+    if "quant" in key:
+        return "quant"
+    if any(x in key for x in ("rmsnorm", "layer_norm", "layernorm", "norm")):
+        return "norm"
+    if any(
+        x in key
+        for x in (
+            "elementwise_kernel",
+            "unrolled_elementwise_kernel",
+            "vectorized_elementwise_kernel",
+            "_scatter_gather_elementwise_kernel",
+            "reduce_kernel",
+        )
+    ):
+        return "torch_elementwise"
+    if "memcpy" in key or "copy" in key:
+        return "memcpy"
+    return "other"
+
+
+def _get_profiler_self_device_time_us(event):
+    for attr in (
+        "self_device_time_total",
+        "self_cuda_time_total",
+        "self_xpu_time_total",
+    ):
+        value = getattr(event, attr, None)
+        if value is not None:
+            return float(value or 0.0)
+    return 0.0
+
+
+def _is_cuda_kernel_like_event(name):
+    key = name.strip()
+    lower = key.lower()
+    if lower.startswith(
+        (
+            "aten::",
+            "sglang::",
+            "sgl_kernel::",
+            "cuda",
+            "cu",
+            "record_",
+            "torch-compiled",
+            "## call",
+            "runtime ",
+            "lazy ",
+            "command buffer",
+        )
+    ):
+        return lower.startswith(("memcpy", "memset"))
+    return lower.startswith(
+        (
+            "_zn",
+            "_",
+            "void ",
+            "fused_",
+            "kernel_",
+            "cutlass::",
+            "flashinfer::",
+            "topkgating",
+            "std::",
+            "memcpy",
+        )
+    )
+
+
+def _format_profiler_stack_source(event):
+    stack = getattr(event, "stack", None) or []
+    for frame in stack:
+        frame = str(frame)
+        if "/sglang/" in frame and "bench_one_batch.py" not in frame:
+            return frame.strip()
+    if stack:
+        return str(stack[0]).strip()
+    return "n/a"
+
+
+def _format_profile_key_summary(
+    profiler,
+    model_config: ModelConfig,
+    expert_distribution_output,
+    stage,
+):
+    lines = [f"Key profile summary ({stage}):"]
+    hf_config = model_config.hf_text_config
+    layer_types = getattr(hf_config, "layer_types", None)
+    num_linear_layers = (
+        sum(1 for x in layer_types if x == "linear_attention")
+        if layer_types is not None
+        else 0
+    )
+    num_full_layers = (
+        sum(1 for x in layer_types if x == "full_attention")
+        if layer_types is not None
+        else int(getattr(model_config, "num_attention_layers", 0) or 0)
+    )
+    num_layers = int(getattr(model_config, "num_hidden_layers", 0) or 0)
+    num_experts = _get_config_value(
+        hf_config, "num_experts", "n_routed_experts", "moe_num_experts"
+    )
+    top_k = _get_config_value(hf_config, "num_experts_per_tok", "num_experts_per_token")
+    moe_intermediate_size = _get_config_value(hf_config, "moe_intermediate_size")
+
+    lines.append(
+        "  model: "
+        f"layers={num_layers}, hidden={getattr(model_config, 'hidden_size', None)}, "
+        f"heads={getattr(model_config, 'num_attention_heads', None)}, "
+        f"kv_heads={getattr(model_config, 'num_key_value_heads', None)}, "
+        f"head_dim={getattr(model_config, 'head_dim', None)}, "
+        f"linear_layers={num_linear_layers}, full_attn_layers={num_full_layers}, "
+        f"experts={num_experts}, top_k={top_k}, moe_intermediate={moe_intermediate_size}"
+    )
+
+    moe_summary = _summarize_moe_distribution_for_profile(
+        expert_distribution_output, model_config
+    )
+    if moe_summary is not None:
+        lines.append(
+            "  moe_active: "
+            f"shape={moe_summary['shape']}, "
+            f"avg={moe_summary['avg_active_experts_per_step_layer']:.2f}, "
+            f"min={moe_summary['min_active_experts_per_step_layer']}, "
+            f"max={moe_summary['max_active_experts_per_step_layer']}, "
+            f"active_expert_instances={moe_summary['active_expert_instances']}, "
+            f"expert_weight={_format_bytes(moe_summary['expert_weight_bytes'])}, "
+            f"active_weight={_format_bytes(moe_summary['active_weight_bytes'])}"
+        )
+
+    if profiler is None:
+        return "\n".join(lines)
+
+    categories = {}
+    top_events = []
+    top_elementwise_events = []
+    for event in profiler.key_averages(group_by_input_shape=True):
+        if not _is_cuda_kernel_like_event(event.key):
+            continue
+        cuda_us = _get_profiler_self_device_time_us(event)
+        cpu_us = float(getattr(event, "self_cpu_time_total", 0.0) or 0.0)
+        count = int(getattr(event, "count", 0) or 0)
+        if cuda_us <= 0 and cpu_us <= 0:
+            continue
+        category = _categorize_profiler_event(event.key)
+        item = categories.setdefault(category, {"cuda_us": 0.0, "cpu_us": 0.0, "count": 0})
+        item["cuda_us"] += cuda_us
+        item["cpu_us"] += cpu_us
+        item["count"] += count
+        top_events.append((cuda_us, count, category, event.key))
+        if category == "torch_elementwise":
+            top_elementwise_events.append(
+                (cuda_us, count, event.key, _format_profiler_stack_source(event))
+            )
+
+    total_cuda_us = sum(item["cuda_us"] for item in categories.values())
+    lines.append("  cuda_by_category:")
+    for category, item in sorted(
+        categories.items(), key=lambda x: x[1]["cuda_us"], reverse=True
+    ):
+        pct = item["cuda_us"] / total_cuda_us * 100 if total_cuda_us > 0 else 0.0
+        lines.append(
+            f"    {category}: {item['cuda_us'] / 1000:.3f} ms "
+            f"({pct:.1f}%), calls={item['count']}"
+        )
+
+    lines.append("  top_cuda_events:")
+    for cuda_us, count, category, key in sorted(top_events, reverse=True)[:12]:
+        avg_us = cuda_us / count if count else 0.0
+        lines.append(
+            f"    {cuda_us / 1000:.3f} ms, calls={count}, "
+            f"avg={avg_us:.3f} us, category={category}, name={key}"
+        )
+    if top_elementwise_events:
+        lines.append("  top_torch_elementwise_sources:")
+        for cuda_us, count, key, source in sorted(
+            top_elementwise_events, reverse=True
+        )[:8]:
+            avg_us = cuda_us / count if count else 0.0
+            lines.append(
+                f"    {cuda_us / 1000:.3f} ms, calls={count}, "
+                f"avg={avg_us:.3f} us, name={key}, source={source}"
+            )
+    return "\n".join(lines)
+
+
 def _get_max_num_moe_experts_for_bench(model_config: ModelConfig):
     hf_config = model_config.hf_text_config
     for attr in (
@@ -307,6 +652,9 @@ def stop_profile(
     stage=None,
     enable_torch_profile=True,
     record_moe_expert_distribution=False,
+    print_moe_expert_distribution=True,
+    print_profile_summary=False,
+    model_config=None,
 ):
     """
     Abstracted function to stop profiling based on profile_activities.
@@ -326,8 +674,16 @@ def stop_profile(
         recorder = get_global_expert_distribution_recorder()
         recorder.stop_record()
         expert_distribution_output = recorder.dump_record(output_mode="object")
+        if print_moe_expert_distribution:
+            rank_print(
+                _format_moe_expert_distribution(expert_distribution_output, stage)
+            )
+
+    if print_profile_summary and model_config is not None:
         rank_print(
-            _format_moe_expert_distribution(expert_distribution_output, stage)
+            _format_profile_key_summary(
+                profiler, model_config, expert_distribution_output, stage
+            )
         )
 
     if enable_torch_profile and save_trace:
@@ -356,7 +712,7 @@ class BenchArgs:
     # This is only used for correctness test
     cut_len: int = 4
     log_decode_step: int = 0
-    profile: bool = False
+    profile: bool = True
     profile_record_shapes: bool = False
     profile_activities: Tuple[str] = ("CPU", "GPU")
     profile_stage: str = "all"
@@ -364,6 +720,7 @@ class BenchArgs:
     profile_start_step: Optional[int] = None
     profile_steps: Optional[int] = None
     print_moe_expert_distribution: bool = False
+    print_profile_summary: bool = True
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -391,7 +748,12 @@ class BenchArgs:
             default=BenchArgs.log_decode_step,
             help="Log decode latency by step, default is set to zero to disable.",
         )
-        parser.add_argument("--profile", action="store_true", help="Enable profiling.")
+        parser.add_argument(
+            "--profile",
+            action=argparse.BooleanOptionalAction,
+            default=BenchArgs.profile,
+            help="Enable profiling.",
+        )
         parser.add_argument(
             "--profile-record-shapes",
             action="store_true",
@@ -435,6 +797,12 @@ class BenchArgs:
             "--print-moe-expert-distribution",
             action="store_true",
             help="Print MoE expert selection totals recorded between start_profile and stop_profile.",
+        )
+        parser.add_argument(
+            "--print-profile-summary",
+            action=argparse.BooleanOptionalAction,
+            default=BenchArgs.print_profile_summary,
+            help="Print a compact summary of model config, key profiler categories, and MoE active weight estimates.",
         )
 
     @classmethod
@@ -758,6 +1126,15 @@ def _save_profile_trace_results(profiler, filename):
     )
 
 
+def _get_bench_model_config(model_runner):
+    if hasattr(model_runner, "model_config"):
+        return model_runner.model_config
+    torch_runner = getattr(model_runner, "torch_runner", None)
+    if torch_runner is not None and hasattr(torch_runner, "model_config"):
+        return torch_runner.model_config
+    return None
+
+
 def correctness_test(
     server_args,
     port_args,
@@ -833,6 +1210,7 @@ def latency_test_run_once(
     profile_start_step=None,
     profile_steps=None,
     print_moe_expert_distribution=False,
+    print_profile_summary=False,
 ):
     max_batch_size = model_runner.max_batch_size(input_len, output_len)
     if batch_size > max_batch_size:
@@ -849,13 +1227,15 @@ def latency_test_run_once(
         "input_len": input_len,
         "output_len": output_len,
     }
+    model_config = _get_bench_model_config(model_runner)
 
     tot_latency = 0
 
     profiler = None
     enable_torch_profile_prefill = profile and profile_stage in ["all", "prefill"]
     enable_moe_profile_prefill = (
-        print_moe_expert_distribution and profile_stage in ["all", "prefill"]
+        (print_moe_expert_distribution or print_profile_summary)
+        and profile_stage in ["all", "prefill"]
     )
     if enable_torch_profile_prefill or enable_moe_profile_prefill:
         if enable_moe_profile_prefill:
@@ -889,6 +1269,9 @@ def latency_test_run_once(
             stage="prefill",
             enable_torch_profile=enable_torch_profile_prefill,
             record_moe_expert_distribution=enable_moe_profile_prefill,
+            print_moe_expert_distribution=print_moe_expert_distribution,
+            print_profile_summary=print_profile_summary,
+            model_config=model_config,
         )
 
     tot_latency += prefill_latency
@@ -907,7 +1290,8 @@ def latency_test_run_once(
     profile_end = profile_start + (profile_steps if profile_steps is not None else 1)
     enable_torch_profile_decode = profile and profile_stage in ["all", "decode"]
     enable_moe_profile_decode = (
-        print_moe_expert_distribution and profile_stage in ["all", "decode"]
+        (print_moe_expert_distribution or print_profile_summary)
+        and profile_stage in ["all", "decode"]
     )
     profiler = None
     decode_profile_started = False
@@ -956,6 +1340,9 @@ def latency_test_run_once(
                 stage="decode",
                 enable_torch_profile=enable_torch_profile_decode,
                 record_moe_expert_distribution=enable_moe_profile_decode,
+                print_moe_expert_distribution=print_moe_expert_distribution,
+                print_profile_summary=print_profile_summary,
+                model_config=model_config,
             )
             profiler = None
             decode_profile_started = False
@@ -981,6 +1368,9 @@ def latency_test_run_once(
             stage="decode",
             enable_torch_profile=enable_torch_profile_decode,
             record_moe_expert_distribution=enable_moe_profile_decode,
+            print_moe_expert_distribution=print_moe_expert_distribution,
+            print_profile_summary=print_profile_summary,
+            model_config=model_config,
         )
 
     # Record decode timing from 2nd output
@@ -1025,7 +1415,7 @@ def latency_test(
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
-    if bench_args.print_moe_expert_distribution:
+    if bench_args.print_moe_expert_distribution or bench_args.print_profile_summary:
         model_config = ModelConfig.from_server_args(server_args)
         max_profile_steps = max(
             1,
@@ -1069,6 +1459,7 @@ def latency_test(
         profile_start_step=None,
         profile_steps=None,
         print_moe_expert_distribution=False,
+        print_profile_summary=False,
     )
 
     rank_print("Benchmark ...")
@@ -1121,6 +1512,7 @@ def latency_test(
             bench_args.profile_start_step,
             bench_args.profile_steps,
             bench_args.print_moe_expert_distribution,
+            bench_args.print_profile_summary,
         )
         if ret is not None:
             result_list.append(ret)
@@ -1137,10 +1529,10 @@ def latency_test(
 
 def main(server_args, bench_args):
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)
-    if bench_args.print_moe_expert_distribution:
+    if bench_args.print_moe_expert_distribution or bench_args.print_profile_summary:
         if server_args.expert_distribution_recorder_mode is not None:
             logging.warning(
-                "--print-moe-expert-distribution uses a bench-local recorder; ignoring "
+                "bench_one_batch MoE profiling uses a bench-local recorder; ignoring "
                 f"expert_distribution_recorder_mode={server_args.expert_distribution_recorder_mode!r}."
             )
         server_args.expert_distribution_recorder_mode = None

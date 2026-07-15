@@ -30,6 +30,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # ================================================
     scale,
     T,
+    stride_a,
     stride_q,
     stride_k,
     stride_v,
@@ -81,23 +82,30 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Gating computation pointers
     p_A_log = A_log + i_hv
     if IS_KDA:
-        p_a = a + (bos * HV + i_hv) * K + o_k
+        p_a = a + bos * stride_a + i_hv * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
     else:
-        p_a = a + bos * HV + i_hv
+        p_a = a + bos * stride_a + i_hv
         p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
+    exp_A_log = tl.exp(tl.load(p_A_log).to(tl.float32))
+    if IS_KDA:
+        dt_bias_val = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
+    else:
+        dt_bias_val = tl.load(p_dt_bias).to(tl.float32)
+
+    state_idx = -1
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
-        if idx >= 0:
+        state_idx = tl.load(h0_indices + i_n)
+        if state_idx >= 0:
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + state_idx * HV * K * V
                 + i_hv * K * V
                 + o_v[None, :] * K
                 + o_k[:, None]
@@ -150,16 +158,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # Compute sigmoid gating
         # Load gating parameters
-        b_A_log = tl.load(p_A_log).to(tl.float32)
         if IS_KDA:
             b_a = tl.load(p_a, mask=mask_k, other=0).to(tl.float32)
-            b_dt_bias = tl.load(p_dt_bias, mask=mask_k, other=0).to(tl.float32)
         else:
             b_a = tl.load(p_a).to(tl.float32)
-            b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
-        x = b_a + b_dt_bias
+        x = b_a + dt_bias_val
         beta_x = softplus_beta * x
         # Apply softplus with numerical stability
         softplus_x = tl.where(
@@ -167,10 +172,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
             x,
         )
-        b_g = -tl.exp(b_A_log) * softplus_x
+        b_g = -exp_A_log * softplus_x
+        b_decay = tl.exp(b_g)
 
         # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        b_beta = tl.sigmoid(b_b)
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
@@ -179,11 +185,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         b_q = b_q * scale
 
-        # Apply gating to hidden state: h *= exp(g)
+        # Apply gating to hidden state.
         if IS_KDA:
-            b_h *= tl.exp(b_g[:, None])
+            b_h *= b_decay[:, None]
         else:
-            b_h *= tl.exp(b_g)
+            b_h *= b_decay
 
         # Delta rule: v -= sum(h * k, dim=0)
         b_v -= tl.sum(b_h * b_k[:, None], 0)
@@ -220,19 +226,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_v += stride_v
         p_b += stride_b
         p_o += HV * V
-        if IS_KDA:
-            p_a += HV * K
-        else:
-            p_a += HV
+        p_a += stride_a
 
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
         if USE_INITIAL_STATE:
-            idx = tl.load(h0_indices + i_n)
-            if idx >= 0:
+            if state_idx >= 0:
                 p_h0 = (
                     h0_source
-                    + idx * HV * K * V
+                    + state_idx * HV * K * V
                     + i_hv * K * V
                     + o_v[None, :] * K
                     + o_k[:, None]
@@ -278,6 +280,10 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_k = k.stride()[1]
     stride_v = v.stride()[1]
     stride_b = b.stride()[-2]
+    # Both paths (KDA/GDN) advance p_a once per token, so use the token-axis stride.
+    # For 2D a ([T, ...]) this is stride(0); for 3D a ([B, T, ...]) this is stride(1).
+    # Using stride()[-2] covers GDN [T, HV] and KDA layouts ([T, HV*K] / [B, T, HV*K]).
+    stride_a = a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
@@ -327,6 +333,7 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
         scale=scale,
         T=T,
+        stride_a=stride_a,
         stride_q=stride_q,
         stride_k=stride_k,
         stride_v=stride_v,

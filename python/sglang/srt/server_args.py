@@ -1081,9 +1081,11 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = False
             return
 
+        model_config = self.get_model_config()
+
         # Disable piecewise cuda graph with following conditions:
         # 1. Disable Model Arch
-        if self.get_model_config().is_piecewise_cuda_graph_disabled_model:
+        if model_config.is_piecewise_cuda_graph_disabled_model:
             self.disable_piecewise_cuda_graph = True
         # 2. Speculative decoding
         if self.speculative_algorithm is not None:
@@ -1107,7 +1109,18 @@ class ServerArgs:
         if self.lora_paths or self.enable_lora:
             self.disable_piecewise_cuda_graph = True
         # 9. Multimodal / VLM models
-        if self.get_model_config().is_multimodal:
+        qwen3_5_text_path_piecewise_supported = any(
+            arch
+            in (
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
+            for arch in getattr(model_config.hf_config, "architectures", [])
+        )
+        if (
+            model_config.is_multimodal
+            and not qwen3_5_text_path_piecewise_supported
+        ):
             self.disable_piecewise_cuda_graph = True
         # 10. GGUF quantized models (custom dequant ops unsupported by torch.compile)
         if (

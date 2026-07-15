@@ -439,7 +439,7 @@ def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available)
-    # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
+    # 2. FlashInfer groupwise FP8 (CUTLASS on SM120, TRTLLM on SM100/SM103)
     # 3. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
     # 4. AITER (if AMD GPU with AITER enabled)
     # 5. Triton (fallback)
@@ -462,8 +462,7 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
 
     backend = server_args.fp8_gemm_runner_backend
     if backend == "auto" and is_sm120_supported():
-        # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
-        backend = "triton"
+        backend = "cutlass"
 
     FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend(backend)
 

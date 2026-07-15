@@ -661,6 +661,160 @@ def launch_reshape_and_cache_flash(
 
 
 @triton.jit
+def _reshape_and_cache_flat_kernel(
+    key_ptr,
+    value_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    slot_mapping_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    key_stride_t,
+    key_stride_h,
+    key_stride_d,
+    value_stride_t,
+    value_stride_h,
+    value_stride_d,
+    cache_key_stride_t,
+    cache_key_stride_h,
+    cache_key_stride_d,
+    cache_value_stride_t,
+    cache_value_stride_h,
+    cache_value_stride_d,
+    num_heads,
+    head_size,
+    value_head_size,
+    fp8_min,
+    fp8_max,
+    HEAD_BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    USE_SCALE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_block_idx = tl.program_id(1)
+
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    if slot_idx < 0:
+        return
+
+    head_idx = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+    dim_idx = tl.arange(0, BLOCK_D)
+
+    head_mask = head_idx < num_heads
+    key_dim_mask = dim_idx < head_size
+    value_dim_mask = dim_idx < value_head_size
+
+    key_src = (
+        token_idx * key_stride_t
+        + head_idx[:, None] * key_stride_h
+        + dim_idx * key_stride_d
+    )
+    value_src = (
+        token_idx * value_stride_t
+        + head_idx[:, None] * value_stride_h
+        + dim_idx * value_stride_d
+    )
+    key_dst = (
+        slot_idx * cache_key_stride_t
+        + head_idx[:, None] * cache_key_stride_h
+        + dim_idx * cache_key_stride_d
+    )
+    value_dst = (
+        slot_idx * cache_value_stride_t
+        + head_idx[:, None] * cache_value_stride_h
+        + dim_idx * cache_value_stride_d
+    )
+
+    k = tl.load(key_ptr + key_src, mask=head_mask[:, None] & key_dim_mask[None, :])
+    v = tl.load(
+        value_ptr + value_src,
+        mask=head_mask[:, None] & value_dim_mask[None, :],
+    )
+
+    if USE_SCALE:
+        # Match the existing in-place BF16 div_/clamp_ path exactly. Keeping
+        # this intermediate rounding is important for non-trivial KV scales.
+        k = (k.to(tl.float32) / tl.load(k_scale_ptr)).to(tl.bfloat16)
+        v = (v.to(tl.float32) / tl.load(v_scale_ptr)).to(tl.bfloat16)
+        k = tl.clamp(k, fp8_min, fp8_max).to(tl.bfloat16)
+        v = tl.clamp(v, fp8_min, fp8_max).to(tl.bfloat16)
+
+    tl.store(
+        key_cache_ptr + key_dst,
+        k,
+        mask=head_mask[:, None] & key_dim_mask[None, :],
+    )
+    tl.store(
+        value_cache_ptr + value_dst,
+        v,
+        mask=head_mask[:, None] & value_dim_mask[None, :],
+    )
+
+
+def launch_reshape_and_cache_flat(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """Scale, cast, and scatter K/V into an FP8 cache in one kernel."""
+    assert key.dim() == value.dim() == 3
+    assert key_cache.dim() == value_cache.dim() == 3
+    assert key.shape[:2] == value.shape[:2]
+    assert key_cache.shape[1:] == key.shape[1:]
+    assert value_cache.shape[1:] == value.shape[1:]
+    assert slot_mapping.numel() == key.shape[0]
+    assert key_cache.dtype == value_cache.dtype == torch.float8_e4m3fn
+    assert (k_scale is None) == (v_scale is None)
+    if k_scale is not None:
+        assert k_scale.numel() == v_scale.numel() == 1
+
+    num_tokens = key.shape[0]
+    num_heads = key.shape[1]
+    head_size = key.shape[2]
+    value_head_size = value.shape[2]
+
+    head_block = 4
+    block_d = triton.next_power_of_2(max(head_size, value_head_size))
+    fp8_info = torch.finfo(key_cache.dtype)
+
+    _reshape_and_cache_flat_kernel[
+        (num_tokens, triton.cdiv(num_heads, head_block))
+    ](
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        k_scale if k_scale is not None else key,
+        v_scale if v_scale is not None else key,
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        value_cache.stride(2),
+        num_heads,
+        head_size,
+        value_head_size,
+        fp8_info.min,
+        fp8_info.max,
+        HEAD_BLOCK=head_block,
+        BLOCK_D=block_d,
+        USE_SCALE=(k_scale is not None and v_scale is not None),
+    )
+
+
+@triton.jit
 def _get_gptj_rotated_x(
     x,
     x_rotated_mask,

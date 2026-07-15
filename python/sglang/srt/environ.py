@@ -466,6 +466,9 @@ class Envs:
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+    # Debug-only: skip Mamba/GDN state materialization copies while preserving
+    # radix metadata and scheduling decisions. This breaks correctness.
+    SGLANG_MAMBA_CACHE_COPY_BYPASS = EnvBool(False)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
