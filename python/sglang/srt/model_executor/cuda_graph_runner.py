@@ -504,7 +504,16 @@ def set_global_graph_memory_pool(val):
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        *,
+        capture_forward_mode_override: Optional[ForwardMode] = None,
+        num_tokens_per_bs_override: Optional[int] = None,
+        capture_hidden_mode_override: Optional[CaptureHiddenMode] = None,
+        seq_len_fill_value_override: Optional[int] = None,
+        spec_info_factory: Optional[Callable[[int], object]] = None,
+    ):
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
@@ -547,21 +556,29 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if (
-            model_runner.spec_algorithm.is_eagle()
-            or model_runner.spec_algorithm.is_standalone()
-            or model_runner.spec_algorithm.is_ngram()
-        ):
-            if self.model_runner.is_draft_worker:
-                raise RuntimeError("This should not happen")
-            else:
-                self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-                self.num_tokens_per_bs = (
-                    self.model_runner.server_args.speculative_num_draft_tokens
-                )
-        elif self.is_dllm:
-            self.capture_forward_mode = ForwardMode.DLLM_EXTEND
-            self.num_tokens_per_bs = self.dllm_config.block_size
+        self._spec_info_factory = spec_info_factory
+        if capture_forward_mode_override is None:
+            if (
+                model_runner.spec_algorithm.uses_eagle_verify_input()
+                or model_runner.spec_algorithm.is_ngram()
+            ):
+                if self.model_runner.is_draft_worker:
+                    raise RuntimeError("This should not happen")
+                else:
+                    self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+                    self.num_tokens_per_bs = (
+                        self.model_runner.server_args.speculative_num_draft_tokens
+                    )
+            elif self.is_dllm:
+                self.capture_forward_mode = ForwardMode.DLLM_EXTEND
+                self.num_tokens_per_bs = self.dllm_config.block_size
+
+        if capture_forward_mode_override is not None:
+            self.capture_forward_mode = capture_forward_mode_override
+        if num_tokens_per_bs_override is not None:
+            self.num_tokens_per_bs = int(num_tokens_per_bs_override)
+        if capture_hidden_mode_override is not None:
+            self.capture_hidden_mode = capture_hidden_mode_override
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
@@ -589,6 +606,8 @@ class CudaGraphRunner:
             if self.dllm_config is None
             else self.dllm_config.block_size
         )
+        if seq_len_fill_value_override is not None:
+            self.seq_len_fill_value = int(seq_len_fill_value_override)
 
         # Non-zero encoder length ensures cross-attention kernels are captured in the graph.
         self.encoder_len_fill_value = (
@@ -669,8 +688,7 @@ class CudaGraphRunner:
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
+                if self.model_runner.spec_algorithm.uses_eagle_verify_input()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -1081,8 +1099,7 @@ class CudaGraphRunner:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
+                if self.model_runner.spec_algorithm.uses_eagle_verify_input()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -1167,7 +1184,11 @@ class CudaGraphRunner:
                 full_logits = output.full_logits[: self.raw_num_token]
             else:
                 full_logits = None
-                next_token_logits = output.next_token_logits[: self.raw_num_token]
+                next_token_logits = (
+                    output.next_token_logits[: self.raw_num_token]
+                    if output.next_token_logits is not None
+                    else None
+                )
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
@@ -1184,10 +1205,11 @@ class CudaGraphRunner:
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
     def get_spec_info(self, num_tokens: int):
+        if self._spec_info_factory is not None:
+            return self._spec_info_factory(num_tokens)
         spec_info = None
         if (
-            self.model_runner.spec_algorithm.is_eagle()
-            or self.model_runner.spec_algorithm.is_standalone()
+            self.model_runner.spec_algorithm.uses_eagle_verify_input()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 

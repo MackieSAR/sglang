@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    DSPARK = auto()
     NONE = auto()
 
     @classmethod
@@ -46,8 +47,14 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_dspark(self) -> bool:
+        return self == SpeculativeAlgorithm.DSPARK
+
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_dspark()
+
+    def uses_eagle_verify_input(self) -> bool:
+        return self.is_eagle() or self.is_standalone() or self.is_dspark()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -101,6 +108,14 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_dspark():
+            if not enable_overlap:
+                raise ValueError("DSpark static decoding requires overlap scheduling.")
+            from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+                DSparkWorkerV2,
+            )
+
+            return DSparkWorkerV2
 
         raise ValueError("Unreachable code path in create_worker.")
 

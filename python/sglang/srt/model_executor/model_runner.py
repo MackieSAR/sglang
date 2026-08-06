@@ -652,6 +652,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
+        # Static DSpark consumes the same auxiliary target-layer hidden states
+        # as EAGLE3, but its layer ids come from the draft checkpoint.
+        if self.spec_algorithm.is_dspark() and not self.is_draft_worker:
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                parse_dspark_draft_config,
+            )
+            from sglang.srt.utils.hf_transformers_utils import get_config
+
+            draft_hf_config = get_config(
+                self.server_args.speculative_draft_model_path,
+                trust_remote_code=self.server_args.trust_remote_code,
+                revision=self.server_args.speculative_draft_model_revision,
+            )
+            dspark_config = parse_dspark_draft_config(draft_hf_config)
+            self.model.set_eagle3_layers_to_capture(
+                list(dspark_config.target_layer_ids)
+            )
+
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
@@ -2088,8 +2106,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False
 
         if (
-            self.spec_algorithm.is_eagle()
-            or self.spec_algorithm.is_standalone()
+            self.spec_algorithm.uses_eagle_verify_input()
             or self.spec_algorithm.is_ngram()
         ):
             return not self.is_draft_worker
@@ -2122,8 +2139,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
         if (
-            self.spec_algorithm.is_eagle()
-            or self.spec_algorithm.is_standalone()
+            self.spec_algorithm.uses_eagle_verify_input()
             or self.spec_algorithm.is_ngram()
         ):
             if self.is_draft_worker:
@@ -2252,7 +2268,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         def get_spec_info():
             spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            if self.spec_algorithm.uses_eagle_verify_input():
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
                 if self.is_draft_worker:

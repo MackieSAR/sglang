@@ -154,6 +154,14 @@ class FlashInferAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.page_size = model_runner.page_size
+        # DSpark static verification is a single linear token chain.  The
+        # generic EAGLE path represents it as a custom tree mask, which selects
+        # FlashInfer's substantially slower custom-mask kernel.  A causal mask
+        # is exactly equivalent for this fixed chain.
+        self.use_dspark_causal_verify = (
+            model_runner.server_args.speculative_algorithm == "DSPARK"
+            and not model_runner.is_draft_worker
+        )
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -306,6 +314,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
+        self.dspark_cuda_graph_block_size = {}
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
     def _process_multi_item_scoring(
@@ -601,6 +610,14 @@ class FlashInferAttnBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
+                verify_mask_buffers = (
+                    {}
+                    if self.use_dspark_causal_verify
+                    else {
+                        "custom_mask_buf": self.cuda_graph_custom_mask,
+                        "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
+                    }
+                )
                 prefill_wrappers.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -611,8 +628,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        custom_mask_buf=self.cuda_graph_custom_mask,
-                        mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        **verify_mask_buffers,
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
@@ -628,6 +644,37 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+        elif forward_mode.is_extend():
+            block_size = num_tokens // bs
+            prefill_wrappers = []
+            for i in range(self.num_wrappers):
+                prefill_wrappers.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend=self.prefill_backend,
+                        use_cuda_graph=True,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                    )
+                )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens.cpu(),
+                seq_lens_sum,
+                prefix_lens=seq_lens - block_size,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=False,
+                encoder_lens=encoder_lens,
+                spec_info=None,
+            )
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.dspark_cuda_graph_block_size[bs] = block_size
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
@@ -725,6 +772,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+            )
+        elif forward_mode.is_extend():
+            block_size = self.dspark_cuda_graph_block_size[bs]
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                seq_lens_sum,
+                prefix_lens=seq_lens[:bs] - block_size,
+                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                use_ragged=False,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=None,
             )
         elif forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
@@ -866,7 +926,10 @@ class FlashInferAttnBackend(AttentionBackend):
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
+                causal=(
+                    not layer.is_cross_attention
+                    and layer.attn_type != AttentionType.ENCODER_ONLY
+                ),
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
                 # - Sliding window could cut across item boundaries, breaking semantic coherence
@@ -1539,6 +1602,8 @@ class FlashInferIndicesUpdaterPrefill:
                 )
             )
             bs_eff = bs
+            if self.attn_backend.use_dspark_causal_verify:
+                custom_mask = None
 
         # extend part
         if use_ragged:

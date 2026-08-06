@@ -53,6 +53,11 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
 
+    # DSpark writes captured target states directly into the draft KV cache.
+    # Its overlap future map only needs the verified token and sequence length.
+    if server_args.speculative_algorithm == "DSPARK":
+        return False
+
     # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
     return not server_args.enable_multi_layer_eagle
 

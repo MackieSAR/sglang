@@ -13,6 +13,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
   - [EAGLE-3 Decoding](#eagle-3-decoding)
 - [Multi Token Prediction](#multi-token-prediction)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
+- [Static DSpark Decoding](#static-dspark-decoding)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
 - [Full Parameter Reference](#full-parameter-reference)
@@ -39,6 +40,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 | EAGLE-3 | EAGLE3 draft model | Yes | `--speculative-algorithm EAGLE3` + `--speculative-draft-model-path ...` | Best throughput in the benchmark below |
 | MTP | Built-in multi-token heads (model-specific) | Often no | See **Multi Token Prediction** section | Uses speculative workflow; draft path may be auto-handled for some models |
 | STANDALONE | Smaller draft LLM (token-level) | Yes | `--speculative-algorithm STANDALONE` + `--speculative-draft-model-path ...` | Does **not** support `--enable-dp-attention` |
+| DSpark (static) | Semi-AR fixed-size block model | Yes | `--speculative-algorithm DSPARK` + `--speculative-draft-model-path ...` | CUDA, Qwen3 dense draft, fixed checkpoint block size |
 | SpecV2 (experimental) | V2 workers + overlap scheduler | N/A | `SGLANG_ENABLE_SPEC_V2=True` | Only supports `--speculative-eagle-topk 1`; applies to `EAGLE`, `EAGLE3`, `STANDALONE` |
 | NGRAM | Ngram cache from previous tokens | No | `--speculative-algorithm NGRAM` | CUDA-only; no `--enable-dp-attention`; disables overlap scheduler & mixed chunked prefill |
 
@@ -376,6 +378,31 @@ print(response.choices[0].message.content)
 
 ---
 
+## Static DSpark Decoding
+
+Static DSpark generates a fixed-size semi-autoregressive proposal block and
+reuses the existing EAGLE V2 linear-tree verification and acceptance path. The
+proposal length is read from the draft checkpoint; no confidence scheduling,
+SPS table, or ragged verification is enabled.
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-14B \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path deepseek-ai/dspark_qwen3_14b_block7 \
+    --mem-fraction-static 0.7 \
+    --cuda-graph-max-bs 4
+```
+
+`--speculative-dspark-block-size` is optional. It overrides the checkpoint's
+default block size for the lifetime of the server. The selected size remains
+fixed for every decoding step, but may be smaller than the checkpoint's
+training block size (for example, `4` with a block-7 checkpoint). This backport
+supports CUDA, `pp_size=1`, dense Qwen3 DSpark drafts, and does not support DP
+attention.
+
+---
+
 ## Ngram Speculative Decoding
 
 SGLang also supports **ngram-based speculative decoding** (no separate draft model). It retrieves draft tokens from an ngram cache built from previously generated tokens, and then verifies them with the target model.
@@ -441,7 +468,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `--speculative-algorithm` | `str` | `None` | Algorithm to use: `EAGLE`, `EAGLE3`, `STANDALONE`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
+| `--speculative-algorithm` | `str` | `None` | Algorithm to use: `EAGLE`, `EAGLE3`, `STANDALONE`, `DSPARK`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
 | `--speculative-draft-model-path` | `str` | `None` | Path to the draft model weights |
 | `--speculative-draft-model-revision` | `str` | `None` | Specific revision/commit of the draft model (`"main"` is auto-used when draft path is set and revision is omitted) |
 | `--speculative-draft-load-format` | `str` | `None` | Load format for draft model weights |

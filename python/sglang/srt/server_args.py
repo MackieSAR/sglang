@@ -497,6 +497,7 @@ class ServerArgs:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    speculative_dspark_block_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -1087,8 +1088,12 @@ class ServerArgs:
         # 1. Disable Model Arch
         if model_config.is_piecewise_cuda_graph_disabled_model:
             self.disable_piecewise_cuda_graph = True
-        # 2. Speculative decoding
-        if self.speculative_algorithm is not None:
+        # 2. Speculative decoding. Static DSpark has its own draft graph and
+        # supports the target model's piecewise prefill graph independently.
+        if (
+            self.speculative_algorithm is not None
+            and self.speculative_algorithm != "DSPARK"
+        ):
             self.disable_piecewise_cuda_graph = True
         # 3. DP attention
         if self.enable_dp_attention:
@@ -2996,6 +3001,52 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        if self.speculative_algorithm == "DSPARK":
+            if not self.device.startswith("cuda"):
+                raise ValueError("DSpark speculative decoding only supports CUDA.")
+            if self.pp_size != 1:
+                raise ValueError("DSpark speculative decoding requires pp_size == 1.")
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "The static DSpark backport does not support DP attention."
+                )
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "DSpark requires --speculative-draft-model-path."
+                )
+
+            from sglang.srt.speculative.dspark_components.dspark_config import (
+                parse_dspark_draft_config,
+            )
+            from sglang.srt.utils.hf_transformers_utils import get_config
+
+            draft_config = get_config(
+                self.speculative_draft_model_path,
+                trust_remote_code=self.trust_remote_code,
+                revision=self.speculative_draft_model_revision,
+            )
+            dspark_config = parse_dspark_draft_config(draft_config)
+            gamma = (
+                int(self.speculative_dspark_block_size)
+                if self.speculative_dspark_block_size is not None
+                else dspark_config.gamma
+            )
+            if gamma < 1:
+                raise ValueError(
+                    f"--speculative-dspark-block-size must be positive, got {gamma}."
+                )
+            self.speculative_num_steps = gamma
+            self.speculative_eagle_topk = 1
+            self.speculative_num_draft_tokens = gamma + 1
+            if self.speculative_draft_attention_backend is None:
+                self.speculative_draft_attention_backend = (
+                    "triton" if is_hip() else "flashinfer"
+                )
+            self.disable_overlap_schedule = False
+            self.enable_mixed_chunk = False
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -4772,7 +4823,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "DSPARK"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4815,6 +4866,15 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-dspark-block-size",
+            type=int,
+            default=ServerArgs.speculative_dspark_block_size,
+            help=(
+                "Fixed DSpark proposal length (gamma). Overrides the draft "
+                "checkpoint's default block size."
+            ),
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
