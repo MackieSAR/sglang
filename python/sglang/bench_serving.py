@@ -8,6 +8,8 @@ Usage:
 python3 -m sglang.bench_serving --backend sglang --num-prompt 10
 
 python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
+
+python3 -m sglang.bench_serving --backend sglang-oai-chat --dataset-name openai --dataset-path /path/to/openai.json
 """
 
 import argparse
@@ -101,6 +103,7 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    cached_tokens: int = 0
     start_time: float = 0.0
 
     @staticmethod
@@ -126,6 +129,14 @@ def get_request_headers() -> Dict[str, str]:
     if h := getattr(args, "header", None):
         headers.update(parse_custom_headers(h))
     return headers
+
+
+def _get_cached_tokens(usage: Optional[Dict[str, Any]]) -> int:
+    """Extract the number of cached prompt tokens from OpenAI usage data."""
+    if not usage:
+        return 0
+    prompt_tokens_details = usage.get("prompt_tokens_details") or {}
+    return prompt_tokens_details.get("cached_tokens", 0) or 0
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -242,6 +253,8 @@ async def async_request_openai_completions(
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
         }
+        if not args.disable_stream:
+            payload["stream_options"] = {"include_usage": True}
 
         # Add temperature default only if not specified in extra_request_body
         if "temperature" not in request_func_input.extra_request_body:
@@ -294,10 +307,19 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
 
+                            usage = data.get("usage") or {}
+                            output_len = usage.get("completion_tokens", output_len)
+                            output.prompt_len = usage.get(
+                                "prompt_tokens", output.prompt_len
+                            )
+                            output.cached_tokens = _get_cached_tokens(usage)
+
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            choices = data.get("choices") or []
+                            text = choices[0].get("text", "") if choices else ""
+                            if text:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -307,15 +329,12 @@ async def async_request_openai_completions(
                                 # Decoding phase
                                 else:
                                     output.text_chunks.append(
-                                        data["choices"][0]["text"]
+                                        text
                                     )
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
+                                generated_text += text
 
                     output.generated_text = generated_text
                     output.success = True
@@ -398,6 +417,8 @@ async def async_request_openai_chat_completions(
             "max_completion_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
         }
+        if not args.disable_stream:
+            payload["stream_options"] = {"include_usage": True}
 
         # Add temperature default only if not specified in extra_request_body
         if "temperature" not in request_func_input.extra_request_body:
@@ -445,9 +466,12 @@ async def async_request_openai_chat_completions(
                         output.ttft = (
                             output.latency
                         )  # For non-streaming, TTFT = total latency
-                        output.output_len = response_json.get("usage", {}).get(
-                            "completion_tokens", output_len
+                        usage = response_json.get("usage") or {}
+                        output.output_len = usage.get("completion_tokens", output_len)
+                        output.prompt_len = usage.get(
+                            "prompt_tokens", output.prompt_len
                         )
+                        output.cached_tokens = _get_cached_tokens(usage)
                     else:
                         # Streaming response
                         async for chunk_bytes in response.content:
@@ -463,7 +487,8 @@ async def async_request_openai_chat_completions(
                                 data = json.loads(chunk)
 
                                 # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                choices = data.get("choices") or []
+                                delta = choices[0].get("delta", {}) if choices else {}
                                 content = delta.get("content", "")
 
                                 if content:
@@ -484,9 +509,12 @@ async def async_request_openai_chat_completions(
                                     generated_text += content
 
                                 # Check for usage info in final chunk
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
+                                usage = data.get("usage") or {}
+                                output_len = usage.get("completion_tokens", output_len)
+                                output.prompt_len = usage.get(
+                                    "prompt_tokens", output.prompt_len
                                 )
+                                output.cached_tokens = _get_cached_tokens(usage)
 
                         output.generated_text = generated_text
                         output.success = True
@@ -656,6 +684,11 @@ async def async_request_sglang_generate(
                             pass
                         else:
                             data = json.loads(chunk)
+
+                            meta_info = data.get("meta_info") or {}
+                            output.cached_tokens = meta_info.get(
+                                "cached_tokens", output.cached_tokens
+                            )
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -878,6 +911,8 @@ class BenchmarkMetrics:
     total_input: int
     total_input_text: int
     total_input_vision: int
+    total_cached_tokens: int
+    cache_hit_rate: float
     total_output: int
     total_output_retokenized: int
     request_throughput: float
@@ -964,6 +999,7 @@ def calculate_metrics(
     total_input = 0
     total_input_text = 0
     total_input_vision = 0
+    total_cached_tokens = 0
     completed = 0
     itls: List[float] = []
     tpots: List[float] = []
@@ -986,9 +1022,37 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             if input_requests is not None:
-                total_input += input_requests[i].prompt_len
-                total_input_text += input_requests[i].text_prompt_len
-                total_input_vision += input_requests[i].vision_prompt_len
+                request = input_requests[i]
+                prompt = request.prompt
+                is_openai_multimodal = isinstance(prompt, list) and any(
+                    isinstance(message, dict)
+                    and isinstance(message.get("content"), list)
+                    and any(
+                        isinstance(item, dict)
+                        and item.get("type") in ("image_url", "video_url")
+                        for item in message["content"]
+                    )
+                    for message in prompt
+                )
+                if is_openai_multimodal and outputs[i].prompt_len > 0:
+                    # Chat API usage includes vision tokens, while applying the
+                    # tokenizer template locally generally counts text only.
+                    actual_prompt_len = outputs[i].prompt_len
+                    total_input += actual_prompt_len
+                    total_input_text += request.text_prompt_len
+                    total_input_vision += max(
+                        actual_prompt_len - request.text_prompt_len, 0
+                    )
+                else:
+                    total_input += request.prompt_len
+                    total_input_text += request.text_prompt_len
+                    total_input_vision += request.vision_prompt_len
+            else:
+                # Multi-turn outputs do not have a one-to-one DatasetRow mapping.
+                # OpenAI usage reports the actual accumulated prompt length.
+                total_input += outputs[i].prompt_len
+                total_input_text += outputs[i].prompt_len
+            total_cached_tokens += outputs[i].cached_tokens
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             if use_retokenized_itl:
@@ -1088,6 +1152,8 @@ def calculate_metrics(
         total_input=total_input,
         total_input_text=total_input_text,
         total_input_vision=total_input_vision,
+        total_cached_tokens=total_cached_tokens,
+        cache_hit_rate=(total_cached_tokens / total_input if total_input else 0.0),
         total_output=sum(output_lens),
         total_output_retokenized=sum(retokenized_output_lens),
         request_throughput=completed / dur_s,
@@ -1451,6 +1517,8 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
+    print("{:<40} {:<10}".format("Total cached tokens:", metrics.total_cached_tokens))
+    print("{:<40} {:<10.2%}".format("Cache hit rate:", metrics.cache_hit_rate))
     if args.dataset_name in ["image", "mmmu"]:
         print(
             "{:<40} {:<10}".format(
@@ -1565,6 +1633,8 @@ async def benchmark(
             "total_input_tokens": metrics.total_input,
             "total_input_text_tokens": metrics.total_input_text,
             "total_input_vision_tokens": metrics.total_input_vision,
+            "total_cached_tokens": metrics.total_cached_tokens,
+            "cache_hit_rate": metrics.cache_hit_rate,
             "total_output_tokens": metrics.total_output,
             "total_output_tokens_retokenized": metrics.total_output_retokenized,
             "request_throughput": metrics.request_throughput,
