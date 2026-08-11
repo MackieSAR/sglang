@@ -53,6 +53,16 @@ limitations under the License.
 
 using namespace cute;
 
+#if defined(SGL_KERNEL_FP8_ACCUM_FP16) && defined(SGL_KERNEL_FP8_ACCUM_BF16)
+#error "Only one of SGL_KERNEL_FP8_ACCUM_FP16 or SGL_KERNEL_FP8_ACCUM_BF16 can be defined."
+#elif defined(SGL_KERNEL_FP8_ACCUM_FP16)
+using SglFp8AccumElement = cutlass::half_t;
+#elif defined(SGL_KERNEL_FP8_ACCUM_BF16)
+using SglFp8AccumElement = cutlass::bfloat16_t;
+#else
+using SglFp8AccumElement = float;
+#endif
+
 #if defined CUDA_VERSION && CUDA_VERSION >= 12040
 template <
     typename ElementType,
@@ -276,7 +286,7 @@ void sm89_fp8_dispatch_bias(
     const c10::optional<torch::Tensor>& bias) {
   using ElementInput = cutlass::float_e4m3_t;
   using ElementOutput = OutType;
-  using AccumElementType = float;
+  using AccumElementType = SglFp8AccumElement;
   if (bias) {
     using Gemm = typename DeviceGemmFp8RowwiseSm89<
         ElementInput,
@@ -706,7 +716,7 @@ void sm90_fp8_dispatch_bias(
     bool use_persistent = false) {
   using ElementInput = cutlass::float_e4m3_t;
   using ElementOutput = OutType;
-  using AccumElementType = float;
+  using AccumElementType = SglFp8AccumElement;
   using EpilogueScheduleType = cutlass::epilogue::TmaWarpSpecialized;
 
   if (bias) {
@@ -1038,7 +1048,7 @@ void sm100_fp8_dispatch_bias(
 
   using ElementInput = cutlass::float_e4m3_t;
   using ElementOutput = OutType;
-  using AccumElementType = float;
+  using AccumElementType = SglFp8AccumElement;
 
   // Gemm type with bias
   using BiasGemmDefault = DeviceGemmFp8RowwiseSm100<
@@ -1178,6 +1188,7 @@ template <
     typename MainloopScheduleType,
     typename EpilogueScheduleType,
     typename TileSchedulerType = void,
+    typename EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto,
     bool WithBias = false>
 struct DeviceGemmFp8RowwiseSm120 {
   static_assert(std::is_same_v<ElementType, cutlass::float_e4m3_t>, "ElementType must be FP8(e4m3)");
@@ -1245,7 +1256,7 @@ struct DeviceGemmFp8RowwiseSm120 {
       cutlass::arch::OpClassTensorOp,
       TileShape,
       ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto,
+      EpilogueTileType,
       ElementAccumulator,
       ElementCompute,
       ElementC,
@@ -1387,45 +1398,49 @@ void launch_sm120_fp8_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
-template <typename OutType>
-void sm120_fp8_dispatch_bias(
+template <
+    typename OutType,
+    typename CTAShape,
+    typename ClusterShape,
+    typename MainloopScheduleType,
+    typename EpilogueScheduleType,
+    typename TileSchedulerType,
+    typename EpilogueTileType>
+void sm120_fp8_dispatch_config(
     torch::Tensor& out,
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
-  using CTAShapeDefault = Shape<_128, _128, _128>;
-  using ClusterShapeDefault = Shape<_1, _1, _1>;
-
-  using MainloopScheduleType = cutlass::gemm::collective::KernelScheduleAuto;
-  using EpilogueScheduleType = cutlass::epilogue::collective::EpilogueScheduleAuto;
-  using TileSchedulerType = void;
 
   using ElementInput = cutlass::float_e4m3_t;
   using ElementOutput = OutType;
-  using AccumElementType = float;
+  using AccumElementType = SglFp8AccumElement;
+  // using AccumElementType = half_t;
 
   using BiasGemmDefault = DeviceGemmFp8RowwiseSm120<
       ElementInput,
       ElementOutput,
       AccumElementType,
-      CTAShapeDefault,
-      ClusterShapeDefault,
+      CTAShape,
+      ClusterShape,
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
+      EpilogueTileType,
       true>;
 
   using GemmDefault = DeviceGemmFp8RowwiseSm120<
       ElementInput,
       ElementOutput,
       AccumElementType,
-      CTAShapeDefault,
-      ClusterShapeDefault,
+      CTAShape,
+      ClusterShape,
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
+      EpilogueTileType,
       false>;
 
   if (bias) {
@@ -1436,6 +1451,24 @@ void sm120_fp8_dispatch_bias(
 }
 
 template <typename OutType>
+void sm120_fp8_dispatch_bias(
+    torch::Tensor& out,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const c10::optional<torch::Tensor>& bias) {
+  return sm120_fp8_dispatch_config<
+      OutType,
+      Shape<_128, _128, _128>,
+      Shape<_1, _1, _1>,
+      cutlass::gemm::collective::KernelScheduleAuto,
+      cutlass::epilogue::collective::EpilogueScheduleAuto,
+      void,
+      cutlass::epilogue::collective::EpilogueTileAuto>(out, a, b, scales_a, scales_b, bias);
+}
+
+template <typename OutType>
 void sm120_fp8_dispatch_shape(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -1443,7 +1476,51 @@ void sm120_fp8_dispatch_shape(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
-  return sm120_fp8_dispatch_bias<OutType>(out, a, b, scales_a, scales_b, bias);
+  uint32_t const m = a.size(0);
+  using ClusterShape = Shape<_1, _1, _1>;
+  using AutoEpilogueSchedule = cutlass::epilogue::collective::EpilogueScheduleAuto;
+  using PingpongSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
+  using AutoSchedule = cutlass::gemm::collective::KernelScheduleAuto;
+  using BasicTileScheduler = void;
+
+  if (m <= 16) {
+    return sm120_fp8_dispatch_config<
+        OutType,
+        Shape<_16, _64, _128>,
+        ClusterShape,
+        PingpongSchedule,
+        AutoEpilogueSchedule,
+        BasicTileScheduler,
+        Shape<_16, _32>>(out, a, b, scales_a, scales_b, bias);
+  }
+  if (m <= 32) {
+    return sm120_fp8_dispatch_config<
+        OutType,
+        Shape<_32, _64, _128>,
+        ClusterShape,
+        PingpongSchedule,
+        AutoEpilogueSchedule,
+        BasicTileScheduler,
+        Shape<_32, _32>>(out, a, b, scales_a, scales_b, bias);
+  }
+  if (m <= 256) {
+    return sm120_fp8_dispatch_config<
+        OutType,
+        Shape<_64, _64, _128>,
+        ClusterShape,
+        PingpongSchedule,
+        AutoEpilogueSchedule,
+        BasicTileScheduler,
+        cutlass::epilogue::collective::EpilogueTileAuto>(out, a, b, scales_a, scales_b, bias);
+  }
+  return sm120_fp8_dispatch_config<
+      OutType,
+      Shape<_128, _128, _128>,
+      ClusterShape,
+      AutoSchedule,
+      AutoEpilogueSchedule,
+      BasicTileScheduler,
+      cutlass::epilogue::collective::EpilogueTileAuto>(out, a, b, scales_a, scales_b, bias);
 }
 #endif
 

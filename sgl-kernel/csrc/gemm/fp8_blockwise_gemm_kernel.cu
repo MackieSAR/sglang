@@ -36,6 +36,16 @@
 
 using namespace cute;
 
+#if defined(SGL_KERNEL_FP8_ACCUM_FP16) && defined(SGL_KERNEL_FP8_ACCUM_BF16)
+#error "Only one of SGL_KERNEL_FP8_ACCUM_FP16 or SGL_KERNEL_FP8_ACCUM_BF16 can be defined."
+#elif defined(SGL_KERNEL_FP8_ACCUM_FP16)
+using SglFp8AccumElement = cutlass::half_t;
+#elif defined(SGL_KERNEL_FP8_ACCUM_BF16)
+using SglFp8AccumElement = cutlass::bfloat16_t;
+#else
+using SglFp8AccumElement = float;
+#endif
+
 template <
     typename OutType,
     typename MmaTileShape,
@@ -79,6 +89,8 @@ void launch_sm100_fp8_blockwise_scaled_mm(
   static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
   static constexpr int AlignmentC = AlignmentD;
 
+  // SM100 blockwise collective hard-codes float accumulator in its scale
+  // pipeline; using fp16 here breaks Sm1xxBlockwiseScaleConfig sizes.
   using ElementAccumulator = float;
   using ElementBlockScale = float;
   using ElementCompute = float;
@@ -237,7 +249,7 @@ void launch_sm120_fp8_blockwise_scaled_mm(
       AlignmentD;  // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
 
   // Kernel functional config
-  using ElementAccumulator = float;      // Element type for internal accumulation
+  using ElementAccumulator = SglFp8AccumElement;  // Element type for internal accumulation
   using ArchTag = cutlass::arch::Sm120;  // Tag indicating the minimum SM that supports the intended feature
   using OperatorClass = cutlass::arch::OpClassTensorOp;  // Operator class tag - changed from OpClassBlockScaledTensorOp
 
@@ -358,7 +370,7 @@ void launch_sm120_fp8_blockwise_scaled_mm(
     using PingpongCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
         ArchTag,
         OperatorClass,
-        PerSmTileShape,
+        PingpongMmaTileShape_MNK,
         ClusterShape,
         cutlass::epilogue::collective::EpilogueTileAuto,
         ElementAccumulator,
@@ -392,7 +404,7 @@ void launch_sm120_fp8_blockwise_scaled_mm(
     using PingpongGemmKernel = cutlass::gemm::kernel::
         GemmUniversal<Shape<int, int, int, int>, PingpongCollectiveMainloop, PingpongCollectiveEpilogue, void>;
 
-    if (m <= 64) {
+    if (m <= 256) {
       status = run_gemm(PingpongGemmKernel{});
       if (status != cutlass::Status::kSuccess) {
         status = run_gemm(CooperativeGemmKernel{});
@@ -407,13 +419,132 @@ void launch_sm120_fp8_blockwise_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status));
 }
 
+template <typename OutType, class ClusterShape = Shape<_1, _1, _1>>
+void launch_sm120_fp8_blockwise_scaled_mm_swap_ab(
+    torch::Tensor& out,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b) {
+  using ElementBlockScale = float;
+  using ElementA = cutlass::float_e4m3_t;
+  using ElementB = cutlass::float_e4m3_t;
+  using ElementC = void;
+  using ElementD = OutType;
+  using ElementAccumulator = SglFp8AccumElement;
+  using ElementCompute = float;
+
+  using LayoutATag = cutlass::layout::RowMajor;
+  using LayoutBTag = cutlass::layout::ColumnMajor;
+  using LayoutCTag = cutlass::layout::RowMajor;
+  using LayoutDTag = cutlass::layout::RowMajor;
+  using LayoutATagTranspose = typename cutlass::layout::LayoutTranspose<LayoutATag>::type;
+  using LayoutBTagTranspose = typename cutlass::layout::LayoutTranspose<LayoutBTag>::type;
+  using LayoutCTagTranspose = typename cutlass::layout::LayoutTranspose<LayoutCTag>::type;
+  using LayoutDTagTranspose = typename cutlass::layout::LayoutTranspose<LayoutDTag>::type;
+
+  constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+  constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+  constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+  constexpr int AlignmentC = AlignmentD;
+
+  using ArchTag = cutlass::arch::Sm120;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+  using MmaTileShape = Shape<_128, _32, _128>;
+
+  using ScaleConfig = cutlass::detail::Sm120BlockwiseScaleConfig<
+      128,
+      1,
+      128,
+      cute::UMMA::Major::K,
+      cute::UMMA::Major::MN>;
+  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      MmaTileShape,
+      ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      ElementCompute,
+      ElementC,
+      LayoutCTagTranspose,
+      AlignmentC,
+      ElementD,
+      LayoutDTagTranspose,
+      AlignmentD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+  using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+      sizeof(typename CollectiveEpilogue::SharedStorage))>;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      ElementB,
+      cute::tuple<LayoutBTagTranspose, LayoutSFA>,
+      AlignmentB,
+      ElementA,
+      cute::tuple<LayoutATagTranspose, LayoutSFB>,
+      AlignmentA,
+      ElementAccumulator,
+      MmaTileShape,
+      ClusterShape,
+      StageCount,
+      cutlass::gemm::KernelTmaWarpSpecializedBlockwiseCooperativeSm120>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::
+      GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+
+  using StrideA = typename GemmKernel::StrideA;
+  using StrideB = typename GemmKernel::StrideB;
+  using StrideC = typename GemmKernel::StrideD;
+
+  int m = a.size(0);
+  int k = a.size(1);
+  int n = b.size(1);
+
+  StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+  StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+  StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(n, m, 1));
+
+  LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(n, m, k, 1));
+  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(n, m, k, 1));
+
+  auto a_ptr = static_cast<ElementA*>(a.data_ptr());
+  auto b_ptr = static_cast<ElementB*>(b.data_ptr());
+  auto c_ptr = static_cast<ElementD*>(out.data_ptr());
+  auto scales_a_ptr = static_cast<ElementBlockScale*>(scales_a.data_ptr());
+  auto scales_b_ptr = static_cast<ElementBlockScale*>(scales_b.data_ptr());
+
+  typename GemmKernel::MainloopArguments mainloop_args{
+      b_ptr, stride_b, a_ptr, stride_a, scales_b_ptr, layout_SFA, scales_a_ptr, layout_SFB};
+
+  typename GemmKernel::EpilogueArguments epilogue_args{{}, c_ptr, stride_c, c_ptr, stride_c};
+  epilogue_args.thread.alpha = 1.0f;
+
+  cutlass_gemm_caller<GemmKernel>(
+      a.device(),
+      cute::make_shape(n, m, k, 1),
+      mainloop_args,
+      epilogue_args);
+}
+
 template <typename OutType>
 void sm120_fp8_blockwise_dispatch_shape(
     torch::Tensor& out,
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
-    const torch::Tensor& scales_b) {
+    const torch::Tensor& scales_b,
+    bool use_swap_ab) {
+  if (use_swap_ab) {
+    launch_sm120_fp8_blockwise_scaled_mm_swap_ab<OutType>(out, a, b, scales_a, scales_b);
+    return;
+  }
+
   using MmaTileShape = Shape<_128, _128, _128>;
   using PerSmTileShape = Shape<_128, _128, _128>;
   using EpilogueTileShape = Shape<_128, _64>;
@@ -465,13 +596,13 @@ torch::Tensor fp8_blockwise_scaled_mm(
   auto sm_version = getSMVersion();
 
   int64_t original_rows = mat_a.size(0);
-  torch::Tensor mat_a_padded = pad_tensor(mat_a, /*alignment=*/4);
-  torch::Tensor scales_a_padded = pad_tensor(scales_a, /*alignment=*/4, /*col_major=*/true);
-  torch::Tensor out_padded = torch::empty({mat_a_padded.size(0), mat_b.size(1)}, out.options());
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
 #if defined CUDA_VERSION && CUDA_VERSION >= 12000
   if (sm_version == 90) {
+    torch::Tensor mat_a_padded = pad_tensor(mat_a, /*alignment=*/4);
+    torch::Tensor scales_a_padded = pad_tensor(scales_a, /*alignment=*/4, /*col_major=*/true);
+    torch::Tensor out_padded = torch::empty({mat_a_padded.size(0), mat_b.size(1)}, out.options());
     torch::Tensor scales_b_contiguous = scales_b.contiguous();
     if (out_dtype == torch::kBFloat16) {
       cutlass_gemm_blockwise_sm90_fp8_dispatch<cutlass::bfloat16_t>(
@@ -492,6 +623,9 @@ torch::Tensor fp8_blockwise_scaled_mm(
       || sm_version == 103
 #endif
   ) {
+    torch::Tensor mat_a_padded = pad_tensor(mat_a, /*alignment=*/4);
+    torch::Tensor scales_a_padded = pad_tensor(scales_a, /*alignment=*/4, /*col_major=*/true);
+    torch::Tensor out_padded = torch::empty({mat_a_padded.size(0), mat_b.size(1)}, out.options());
     if (out_dtype == torch::kBFloat16) {
       sm100_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
           out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
@@ -506,11 +640,25 @@ torch::Tensor fp8_blockwise_scaled_mm(
 #if defined(CUTLASS_ARCH_MMA_SM120A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 12080
   if (sm_version >= 120) {
+    bool use_swap_ab = original_rows <= 64;
+    if (use_swap_ab) {
+      if (out_dtype == torch::kBFloat16) {
+        sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, true);
+      } else {
+        sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(out, mat_a, mat_b, scales_a, scales_b, true);
+      }
+      return out;
+    }
+
+    torch::Tensor mat_a_padded = pad_tensor(mat_a, /*alignment=*/4);
+    torch::Tensor scales_a_padded = pad_tensor(scales_a, /*alignment=*/4, /*col_major=*/true);
+    torch::Tensor out_padded = torch::empty({mat_a_padded.size(0), mat_b.size(1)}, out.options());
     if (out_dtype == torch::kBFloat16) {
       sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(
-          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
+          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b, false);
     } else {
-      sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b);
+      sm120_fp8_blockwise_dispatch_shape<cutlass::half_t>(
+          out_padded, mat_a_padded, mat_b, scales_a_padded, scales_b, false);
     }
     return out_padded.slice(0, 0, original_rows);
   }

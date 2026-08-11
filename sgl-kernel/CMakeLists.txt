@@ -43,6 +43,37 @@ find_package(Torch REQUIRED)
 clear_cuda_arches(CMAKE_FLAG)
 
 # Third Party repos
+#
+# Offline dependencies: if a pre-cloned copy exists under offline-deps/, point
+# FetchContent at it via FETCHCONTENT_SOURCE_DIR_<NAME> so the corresponding
+# FetchContent_Declare below skips the network git clone entirely. This makes
+# builds work in environments with slow/blocked access to github.com.
+set(SGL_OFFLINE_DEPS_DIR "${CMAKE_CURRENT_LIST_DIR}/offline-deps")
+foreach(_dep
+        repo-cutlass repo-deepgemm repo-fmt repo-triton
+        repo-flashinfer repo-flash-attention repo-mscclpp repo-flashmla)
+    string(TOUPPER "${_dep}" _dep_upper)
+    set(_dep_local "${SGL_OFFLINE_DEPS_DIR}/${_dep}")
+    if(EXISTS "${_dep_local}")
+        set(FETCHCONTENT_SOURCE_DIR_${_dep_upper} "${_dep_local}")
+        message(STATUS "Using offline dependency for ${_dep}: ${_dep_local}")
+    endif()
+endforeach()
+set(_offline_fetch_names json nanobind dlpack)
+set(_offline_fetch_dirs repo-nlohmann-json repo-nanobind repo-dlpack)
+list(LENGTH _offline_fetch_names _offline_fetch_count)
+math(EXPR _offline_fetch_last "${_offline_fetch_count} - 1")
+foreach(_idx RANGE ${_offline_fetch_last})
+    list(GET _offline_fetch_names ${_idx} _dep_name)
+    list(GET _offline_fetch_dirs ${_idx} _dep_dir)
+    string(TOUPPER "${_dep_name}" _dep_upper)
+    set(_dep_local "${SGL_OFFLINE_DEPS_DIR}/${_dep_dir}")
+    if(EXISTS "${_dep_local}")
+        set(FETCHCONTENT_SOURCE_DIR_${_dep_upper} "${_dep_local}")
+        message(STATUS "Using offline dependency for ${_dep_name}: ${_dep_local}")
+    endif()
+endforeach()
+
 # cutlass
 FetchContent_Declare(
     repo-cutlass
@@ -188,6 +219,16 @@ option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
+set(SGL_KERNEL_FP8_ACCUM_DTYPE "fp32" CACHE STRING "FP8 GEMM accumulator dtype: fp32, fp16, or bf16")
+set_property(CACHE SGL_KERNEL_FP8_ACCUM_DTYPE PROPERTY STRINGS fp32 fp16 bf16)
+
+if (SGL_KERNEL_FP8_ACCUM_DTYPE STREQUAL "fp16")
+    list(APPEND SGL_KERNEL_CUDA_FLAGS "-DSGL_KERNEL_FP8_ACCUM_FP16")
+elseif (SGL_KERNEL_FP8_ACCUM_DTYPE STREQUAL "bf16")
+    list(APPEND SGL_KERNEL_CUDA_FLAGS "-DSGL_KERNEL_FP8_ACCUM_BF16")
+elseif (NOT SGL_KERNEL_FP8_ACCUM_DTYPE STREQUAL "fp32")
+    message(FATAL_ERROR "SGL_KERNEL_FP8_ACCUM_DTYPE must be one of fp32, fp16, bf16")
+endif()
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
